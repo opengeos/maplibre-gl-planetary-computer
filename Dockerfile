@@ -12,10 +12,8 @@ RUN npm ci
 # Copy source files
 COPY . .
 
-# Run tests
-RUN npm test
-
 # Build library and examples
+# Note: Tests are run separately in CI, skipped here for faster builds
 RUN npm run build && npm run build:examples
 
 # Production stage
