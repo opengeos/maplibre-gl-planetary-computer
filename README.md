@@ -2,8 +2,8 @@
 
 [![npm version](https://badge.fury.io/js/maplibre-gl-planetary-computer.svg)](https://www.npmjs.com/package/maplibre-gl-planetary-computer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Open in CodeSandbox](https://img.shields.io/badge/Open%20in-CodeSandbox-blue?logo=codesandbox)](https://codesandbox.io/p/github/opengeos/maplibre-gl-layer-control)
-[![Open in StackBlitz](https://img.shields.io/badge/Open%20in-StackBlitz-blue?logo=stackblitz)](https://stackblitz.com/github/opengeos/maplibre-gl-layer-control)
+[![Open in CodeSandbox](https://img.shields.io/badge/Open%20in-CodeSandbox-blue?logo=codesandbox)](https://codesandbox.io/p/github/opengeos/maplibre-gl-planetary-computer)
+[![Open in StackBlitz](https://img.shields.io/badge/Open%20in-StackBlitz-blue?logo=stackblitz)](https://stackblitz.com/github/opengeos/maplibre-gl-planetary-computer)
 
 A MapLibre GL JS plugin for searching, visualizing, and downloading data from Microsoft Planetary Computer's Earth observation catalog.
 
