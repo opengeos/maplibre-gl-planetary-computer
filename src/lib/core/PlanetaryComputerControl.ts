@@ -469,11 +469,10 @@ export class PlanetaryComputerControl implements IControl {
     toggleBtn.setAttribute('aria-label', this._options.title);
     toggleBtn.innerHTML = `
       <span class="pc-control-icon">
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
-          <rect x="2" y="2" width="9" height="9" rx="1" fill="#f25022"/>
-          <rect x="13" y="2" width="9" height="9" rx="1" fill="#7fba00"/>
-          <rect x="2" y="13" width="9" height="9" rx="1" fill="#00a4ef"/>
-          <rect x="13" y="13" width="9" height="9" rx="1" fill="#ffb900"/>
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M2 12h20"/>
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
         </svg>
       </span>
     `;
@@ -1375,5 +1374,9 @@ export class PlanetaryComputerControl implements IControl {
         this._panel.style.right = `${buttonRight}px`;
         break;
     }
+  }
+
+  getPanelElement(): HTMLElement | null {
+    return this._panel ?? null;
   }
 }
