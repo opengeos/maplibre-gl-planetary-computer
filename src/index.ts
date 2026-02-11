@@ -5,6 +5,9 @@ import './lib/styles/planetary-computer.css';
 export { PlanetaryComputerControl } from './lib/core/PlanetaryComputerControl';
 export { LayerManager } from './lib/core/LayerManager';
 
+// Adapter export
+export { PlanetaryComputerLayerAdapter } from './lib/adapters/PlanetaryComputerLayerAdapter';
+
 // Core type exports
 export type {
   PlanetaryComputerOptions,

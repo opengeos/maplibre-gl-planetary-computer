@@ -23,6 +23,7 @@ const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
   position: 'top-right',
   title: 'Planetary Computer',
   panelWidth: 380,
+  maxHeight: 500,
   className: '',
   stacApiUrl: 'https://planetarycomputer.microsoft.com/api/stac/v1',
   tilerApiUrl: 'https://planetarycomputer.microsoft.com/api/data/v1',
@@ -489,6 +490,7 @@ export class PlanetaryComputerControl implements IControl {
     const panel = document.createElement('div');
     panel.className = 'pc-control-panel';
     panel.style.width = `${this._options.panelWidth}px`;
+    panel.style.maxHeight = `${this._options.maxHeight}px`;
 
     // Prevent clicks inside the panel from triggering the click-outside handler
     panel.addEventListener('click', (e) => e.stopPropagation());
