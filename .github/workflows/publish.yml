@@ -8,10 +8,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
+      # OIDC token for npm trusted publishing and provenance attestation
       id-token: write
+      # Minimal read access for checkout
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
