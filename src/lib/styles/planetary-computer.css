@@ -772,21 +772,21 @@
   gap: 6px;
 }
 
-.pc-stats-grid div,
-.pc-point-values div {
+.pc-stats-grid > div,
+.pc-point-values > div {
   display: flex;
   justify-content: space-between;
   gap: 8px;
   font-size: 12px;
 }
 
-.pc-stats-grid span,
-.pc-point-values span {
+.pc-stats-grid > div > span,
+.pc-point-values > div > span {
   color: #666;
 }
 
-.pc-stats-grid strong,
-.pc-point-values strong {
+.pc-stats-grid > div > strong,
+.pc-point-values > div > strong {
   color: #1a1a1a;
   font-weight: 600;
 }
@@ -850,19 +850,19 @@
   background: #fff;
 }
 
-.pc-tilejson-card div {
+.pc-tilejson-card > div {
   display: flex;
   justify-content: space-between;
   gap: 8px;
   font-size: 12px;
 }
 
-.pc-tilejson-card span {
+.pc-tilejson-card > div > span {
   flex-shrink: 0;
   color: #666;
 }
 
-.pc-tilejson-card strong {
+.pc-tilejson-card > div > strong {
   min-width: 0;
   overflow-wrap: anywhere;
   color: #1a1a1a;

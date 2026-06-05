@@ -1942,7 +1942,7 @@ export class PlanetaryComputerControl implements IControl {
       return statistics;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to load statistics';
-      output.innerHTML = `<div class="pc-tool-error">${errorMessage}</div>`;
+      output.innerHTML = `<div class="pc-tool-error">${this._escapeHtml(errorMessage)}</div>`;
       return null;
     }
   }
@@ -1991,7 +1991,7 @@ export class PlanetaryComputerControl implements IControl {
 
     if (output) {
       output.innerHTML = `
-        <div class="pc-tool-success">Applied stretch ${this._formatNumber(band.stats.min)} to ${this._formatNumber(band.stats.max)} from ${band.label}.</div>
+        <div class="pc-tool-success">Applied stretch ${this._formatNumber(band.stats.min)} to ${this._formatNumber(band.stats.max)} from ${this._escapeHtml(band.label)}.</div>
         ${this._renderStatisticsOutput(statistics)}
       `;
     }
@@ -2145,7 +2145,7 @@ export class PlanetaryComputerControl implements IControl {
     const stats = band.stats;
     return `
       <div class="pc-stats-card">
-        <div class="pc-stats-title">${band.label}</div>
+        <div class="pc-stats-title">${this._escapeHtml(band.label)}</div>
         <div class="pc-stats-grid">
           <div><span>Min</span><strong>${this._formatNumber(stats.min)}</strong></div>
           <div><span>Max</span><strong>${this._formatNumber(stats.max)}</strong></div>

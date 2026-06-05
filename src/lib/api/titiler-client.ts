@@ -34,10 +34,9 @@ export class TiTilerClient {
    */
   getItemTileUrl(collectionId: string, itemId: string, params: TileParams = {}): string {
     const queryString = this.buildQueryString(params);
-    const query = queryString ? `?${queryString}` : '';
     const scale = params.tile_scale || 1;
     const format = params.tile_format ? `.${params.tile_format}` : '';
-    return `${this.baseUrl}/item/tiles/WebMercatorQuad/{z}/{x}/{y}@${scale}x${format}?collection=${encodeURIComponent(collectionId)}&item=${encodeURIComponent(itemId)}${query ? '&' + queryString : ''}`;
+    return `${this.baseUrl}/item/tiles/WebMercatorQuad/{z}/{x}/{y}@${scale}x${format}?collection=${encodeURIComponent(collectionId)}&item=${encodeURIComponent(itemId)}${queryString ? '&' + queryString : ''}`;
   }
 
   /**
