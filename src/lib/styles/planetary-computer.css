@@ -314,8 +314,8 @@
 
 .pc-bbox-display {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: stretch;
   gap: 8px;
   padding: 8px 12px;
   background: #f5f5f5;
@@ -326,6 +326,18 @@
   font-size: 12px;
   color: #666;
   font-family: monospace;
+  word-break: break-word;
+}
+
+.pc-bbox-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-start;
+  white-space: nowrap;
+}
+
+.pc-bbox-coordinates {
+  min-width: 0;
 }
 
 .pc-date-inputs {
@@ -358,6 +370,15 @@
   background: #f5f5f5;
 }
 
+.pc-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.pc-btn:disabled:hover {
+  background: #fff;
+}
+
 .pc-btn-primary {
   background: #0078d4;
   border-color: #0078d4;
@@ -371,6 +392,51 @@
 .pc-btn-small {
   padding: 4px 10px;
   font-size: 12px;
+}
+
+.pc-btn-active {
+  background: #e8f4fd;
+  border-color: #0078d4;
+  color: #005a9e;
+}
+
+.pc-btn-active:hover {
+  background: #d7ecfb;
+}
+
+/* ============ Bounding Box Drawing ============ */
+.pc-bbox-drawing,
+.pc-bbox-drawing canvas {
+  cursor: crosshair !important;
+}
+
+.pc-bbox-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 999;
+  pointer-events: none;
+}
+
+.pc-bbox-box {
+  position: absolute;
+  display: none;
+  border: 2px solid #0078d4;
+  background: rgba(0, 120, 212, 0.16);
+  box-sizing: border-box;
+}
+
+.pc-bbox-instructions {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: rgba(26, 26, 26, 0.82);
+  color: #fff;
+  font-size: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
 }
 
 .pc-btn-icon {
