@@ -145,6 +145,8 @@ export interface STACSearchParams {
 export interface TileParams {
   /** Asset names to use */
   assets?: string[];
+  /** Band indexes */
+  bidx?: number[];
   /** Band math expression */
   expression?: string;
   /** Rescale values (e.g., "0,255" or "0,10000") */
@@ -159,10 +161,100 @@ export interface TileParams {
   resampling?: 'nearest' | 'bilinear' | 'cubic' | 'lanczos';
   /** Return mask */
   return_mask?: boolean;
+  /** Apply internal scale and offset */
+  unscale?: boolean;
+  /** Rio color formula */
+  color_formula?: string;
+  /** Asset as band */
+  asset_as_band?: boolean;
+  /** Processing algorithm */
+  algorithm?: string;
+  /** Processing algorithm parameters */
+  algorithm_params?: string;
+  /** Tile buffer */
+  buffer?: number;
+  /** Tile output format */
+  tile_format?: 'png' | 'jpg' | 'jpeg' | 'webp' | 'pngraw';
+  /** Tile resolution scale */
+  tile_scale?: 1 | 2 | 3 | 4;
+  /** Minimum zoom */
+  minzoom?: number;
+  /** Maximum zoom */
+  maxzoom?: number;
   /** Tile size */
   tile_size?: number;
   /** Asset band indexes */
   asset_bidx?: Record<string, string>;
+}
+
+/**
+ * TileJSON metadata returned by the Data API.
+ */
+export interface TileJSONMetadata {
+  tilejson?: string;
+  name?: string;
+  version?: string;
+  scheme?: string;
+  tiles: string[];
+  minzoom?: number;
+  maxzoom?: number;
+  bounds?: [number, number, number, number];
+  center?: [number, number, number];
+  attribution?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Statistics request options.
+ */
+export interface StatisticsParams extends TileParams {
+  /** Maximum raster size sampled for statistics */
+  max_size?: number;
+  /** Output height */
+  height?: number;
+  /** Output width */
+  width?: number;
+  /** Treat values as categorical */
+  categorical?: boolean;
+  /** Category values */
+  c?: number[];
+  /** Percentiles */
+  p?: number[];
+  /** Histogram bin count */
+  histogram_bins?: number;
+  /** Histogram range */
+  histogram_range?: [number, number];
+}
+
+/**
+ * Band statistics returned by the Data API.
+ */
+export interface BandStatistics {
+  min: number;
+  max: number;
+  mean: number;
+  count: number;
+  sum: number;
+  std: number;
+  median: number;
+  majority: number;
+  minority: number;
+  unique: number;
+  histogram: [number[], number[]];
+  valid_percent: number;
+  masked_pixels: number;
+  valid_pixels: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Point query response returned by the Data API.
+ */
+export interface PointValueResponse {
+  coordinates?: [number, number];
+  values?: unknown[];
+  band_names?: string[];
+  [key: string]: unknown;
 }
 
 /**

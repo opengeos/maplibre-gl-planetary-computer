@@ -103,6 +103,8 @@ export interface ActiveLayer {
   renderParams: TileParams;
   /** Preset name if using a preset */
   presetName?: string;
+  /** Whether advanced per-layer controls are expanded */
+  showControls?: boolean;
 }
 
 /**
@@ -134,6 +136,8 @@ export interface PlanetaryComputerState {
   searchLoading: boolean;
   /** Currently selected item */
   selectedItem: STACItem | null;
+  /** Currently highlighted search result item */
+  selectedSearchResultId: string | null;
   /** Active map layers */
   activeLayers: ActiveLayer[];
   /** Current error message */

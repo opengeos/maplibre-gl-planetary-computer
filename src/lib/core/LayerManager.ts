@@ -62,14 +62,14 @@ export class LayerManager {
     const assets = options?.assets || renderParams.assets || this.getDefaultAssets(item);
     renderParams = { ...renderParams, assets };
 
-    // Generate tile URL
-    const tileUrl = this.tilerClient.getItemTileUrl(collectionId, item.id, renderParams);
+    // Generate TileJSON URL
+    const tileJsonUrl = this.tilerClient.getItemTileJSONUrl(collectionId, item.id, renderParams);
 
     // Add source
     this.map.addSource(sourceId, {
       type: 'raster',
-      tiles: [tileUrl],
-      tileSize: 256,
+      url: tileJsonUrl,
+      tileSize: renderParams.tile_size || 256,
       bounds: item.bbox as [number, number, number, number],
       attribution: 'Microsoft Planetary Computer',
     });
@@ -313,7 +313,7 @@ export class LayerManager {
 
     if (layer.type === 'item' && layer.item) {
       const collectionId = layer.item.collection || '';
-      tileUrl = this.tilerClient.getItemTileUrl(collectionId, layer.item.id, {
+      tileUrl = this.tilerClient.getItemTileJSONUrl(collectionId, layer.item.id, {
         ...newParams,
         assets: newAssets,
       });
@@ -340,8 +340,8 @@ export class LayerManager {
     // Add new source
     this.map.addSource(layer.sourceId, {
       type: 'raster',
-      tiles: [tileUrl],
-      tileSize: 256,
+      ...(layer.type === 'item' ? { url: tileUrl } : { tiles: [tileUrl] }),
+      tileSize: newParams.tile_size || 256,
       bounds: bounds as [number, number, number, number] | undefined,
       attribution: 'Microsoft Planetary Computer',
     });

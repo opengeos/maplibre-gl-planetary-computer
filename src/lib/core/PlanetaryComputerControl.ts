@@ -1,4 +1,11 @@
-import type { IControl, Map as MapLibreMap } from 'maplibre-gl';
+import type {
+  GeoJSONSource,
+  IControl,
+  Map as MapLibreMap,
+  MapLayerMouseEvent,
+  MapMouseEvent,
+} from 'maplibre-gl';
+import type { Feature, FeatureCollection, Geometry, Polygon } from 'geojson';
 import type {
   PlanetaryComputerOptions,
   PlanetaryComputerState,
@@ -7,7 +14,14 @@ import type {
   ActiveLayer,
   PanelView,
 } from './types';
-import type { STACCollection, STACItem, STACSearchParams, TileParams } from '../api/types';
+import type {
+  BandStatistics,
+  PointValueResponse,
+  STACCollection,
+  STACItem,
+  STACSearchParams,
+  TileParams,
+} from '../api/types';
 import { STACClient } from '../api/stac-client';
 import { TiTilerClient } from '../api/titiler-client';
 import { SASTokenManager } from '../api/sas-token';
@@ -33,6 +47,12 @@ const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
   autoLoadCollections: true,
 };
 
+const FOOTPRINT_SOURCE_ID = 'pc-search-footprints';
+const FOOTPRINT_FILL_LAYER_ID = 'pc-search-footprints-fill';
+const FOOTPRINT_OUTLINE_LAYER_ID = 'pc-search-footprints-outline';
+const FOOTPRINT_SELECTED_FILL_LAYER_ID = 'pc-search-footprints-selected-fill';
+const FOOTPRINT_SELECTED_OUTLINE_LAYER_ID = 'pc-search-footprints-selected-outline';
+
 /**
  * Event handlers map type.
  */
@@ -42,6 +62,17 @@ type ScreenPoint = {
   x: number;
   y: number;
 };
+
+type InspectorResult = {
+  layerId: string;
+  lon: number;
+  lat: number;
+  loading: boolean;
+  data?: PointValueResponse;
+  error?: string;
+};
+
+type FootprintFeature = Feature<Geometry | Polygon, { itemId: string; title: string }>;
 
 /**
  * MapLibre GL control for browsing and visualizing Planetary Computer data.
@@ -89,6 +120,12 @@ export class PlanetaryComputerControl implements IControl {
   private _bboxDragPanWasEnabled = false;
   private _bboxBoxZoomWasEnabled = false;
   private _ignoreNextDocumentClick = false;
+  private _inspectClickHandler: ((e: MapMouseEvent) => void) | null = null;
+  private _inspectorLayerId: string | null = null;
+  private _inspectorResult: InspectorResult | null = null;
+  private _footprintClickHandler: ((e: MapLayerMouseEvent) => void) | null = null;
+  private _footprintMouseEnterHandler: (() => void) | null = null;
+  private _footprintMouseLeaveHandler: (() => void) | null = null;
 
   /**
    * Creates a new PlanetaryComputerControl instance.
@@ -140,6 +177,8 @@ export class PlanetaryComputerControl implements IControl {
    */
   onRemove(): void {
     this._stopBboxDraw(false);
+    this._stopInspector(false);
+    this._clearSearchFootprints(false);
 
     // Remove event listeners
     if (this._resizeHandler) {
@@ -236,11 +275,14 @@ export class PlanetaryComputerControl implements IControl {
     this._state.error = null;
     this._emit('search:start');
     this._emit('statechange');
+    this._renderContent();
 
     try {
       const results = await this._stacClient.search(searchParams);
       this._state.searchResults = results;
+      this._state.selectedSearchResultId = null;
       this._state.activeView = 'results';
+      this._showSearchFootprints(results);
       this._emit('search:complete');
       this._emit('search');
       return results;
@@ -271,6 +313,7 @@ export class PlanetaryComputerControl implements IControl {
     if (!this._layerManager) throw new Error('Control not added to map');
 
     const layer = this._layerManager.addItemLayer(item, options);
+    layer.showControls = false;
     this._state.activeLayers.push(layer);
     this._emit('layer:add');
     this._emit('statechange');
@@ -297,6 +340,7 @@ export class PlanetaryComputerControl implements IControl {
     if (!this._layerManager) throw new Error('Control not added to map');
 
     const layer = this._layerManager.addCollectionLayer(collection, options);
+    layer.showControls = false;
     this._state.activeLayers.push(layer);
     this._emit('layer:add');
     this._emit('statechange');
@@ -310,6 +354,9 @@ export class PlanetaryComputerControl implements IControl {
    * @param layerId - Layer identifier.
    */
   removeLayer(layerId: string): void {
+    if (this._inspectorLayerId === layerId) {
+      this._stopInspector(false);
+    }
     this._layerManager?.removeLayer(layerId);
     this._state.activeLayers = this._state.activeLayers.filter((l) => l.id !== layerId);
     this._emit('layer:remove');
@@ -367,10 +414,13 @@ export class PlanetaryComputerControl implements IControl {
    */
   selectCollection(collection: STACCollection | null): void {
     this._stopBboxDraw(false);
+    this._clearSearchFootprints(false);
     this._state.selectedCollection = collection;
     this._state.searchParams = collection ? { collections: [collection.id] } : {};
     this._state.activeView = collection ? 'search' : 'collections';
     this._state.searchResults = [];
+    this._state.selectedItem = null;
+    this._state.selectedSearchResultId = null;
     this._emit('collection:select');
     this._emit('statechange');
     this._renderContent();
@@ -383,6 +433,8 @@ export class PlanetaryComputerControl implements IControl {
    */
   selectItem(item: STACItem | null): void {
     this._state.selectedItem = item;
+    this._state.selectedSearchResultId = item?.id || null;
+    this._updateSelectedFootprint();
     this._state.activeView = item ? 'item' : 'results';
     this._emit('item:select');
     this._emit('statechange');
@@ -458,6 +510,7 @@ export class PlanetaryComputerControl implements IControl {
       searchResults: [],
       searchLoading: false,
       selectedItem: null,
+      selectedSearchResultId: null,
       activeLayers: [],
       error: null,
       bboxSelectorActive: false,
@@ -708,6 +761,7 @@ export class PlanetaryComputerControl implements IControl {
         <div class="pc-selected-collection">
           <span class="pc-label">Collection</span>
           <span class="pc-collection-name">${collection.title || collection.id}</span>
+          <button type="button" class="pc-btn pc-btn-small pc-open-collection-page">Open Webpage</button>
         </div>
 
         <div class="pc-form-group">
@@ -792,8 +846,10 @@ export class PlanetaryComputerControl implements IControl {
             : ''
         }
 
-        <button type="button" class="pc-btn pc-btn-primary pc-search-btn">
-          Search Items
+        <button type="button" class="pc-btn pc-btn-primary pc-search-btn${
+          this._state.searchLoading ? ' pc-search-btn-loading' : ''
+        }" ${this._state.searchLoading ? 'disabled aria-busy="true"' : ''}>
+          ${this._state.searchLoading ? '<span class="pc-search-spinner"></span>Searching...' : 'Search Items'}
         </button>
       </div>
     `;
@@ -801,6 +857,10 @@ export class PlanetaryComputerControl implements IControl {
     // Event handlers
     this._contentEl.querySelector('.pc-btn-back')?.addEventListener('click', () => {
       this.selectCollection(null);
+    });
+
+    this._contentEl.querySelector('.pc-open-collection-page')?.addEventListener('click', () => {
+      window.open(this._getCollectionPageUrl(collection), '_blank');
     });
 
     this._contentEl.querySelector('.pc-use-view')?.addEventListener('click', () => {
@@ -844,6 +904,8 @@ export class PlanetaryComputerControl implements IControl {
     }
 
     this._contentEl.querySelector('.pc-search-btn')?.addEventListener('click', () => {
+      if (this._state.searchLoading) return;
+
       const startDate = (this._contentEl?.querySelector('.pc-date-start') as HTMLInputElement)?.value;
       const endDate = (this._contentEl?.querySelector('.pc-date-end') as HTMLInputElement)?.value;
       const cloudCover = (this._contentEl?.querySelector('.pc-cloud-slider') as HTMLInputElement)?.value;
@@ -916,6 +978,13 @@ export class PlanetaryComputerControl implements IControl {
     }
 
     return false;
+  }
+
+  /**
+   * Gets the public Planetary Computer webpage URL for a collection.
+   */
+  private _getCollectionPageUrl(collection: STACCollection): string {
+    return `https://planetarycomputer.microsoft.com/dataset/${encodeURIComponent(collection.id)}`;
   }
 
   /**
@@ -1092,6 +1161,283 @@ export class PlanetaryComputerControl implements IControl {
   }
 
   /**
+   * Shows search result footprints on the map.
+   */
+  private _showSearchFootprints(items: STACItem[]): void {
+    if (!this._map) return;
+
+    if (!this._map.isStyleLoaded()) {
+      this._map.once('load', () => this._showSearchFootprints(items));
+      return;
+    }
+
+    const data: FeatureCollection<Geometry | Polygon, FootprintFeature['properties']> = {
+      type: 'FeatureCollection',
+      features: items
+        .map((item) => this._itemToFootprintFeature(item))
+        .filter((feature): feature is FootprintFeature => Boolean(feature)),
+    };
+
+    const source = this._map.getSource(FOOTPRINT_SOURCE_ID) as GeoJSONSource | undefined;
+    if (source) {
+      source.setData(data);
+    } else {
+      this._map.addSource(FOOTPRINT_SOURCE_ID, {
+        type: 'geojson',
+        data,
+      });
+    }
+
+    this._ensureFootprintLayers();
+    this._bindFootprintInteractions();
+    this._updateSelectedFootprint();
+  }
+
+  /**
+   * Adds footprint layers if they do not already exist.
+   */
+  private _ensureFootprintLayers(): void {
+    if (!this._map) return;
+
+    if (!this._map.getLayer(FOOTPRINT_FILL_LAYER_ID)) {
+      this._map.addLayer({
+        id: FOOTPRINT_FILL_LAYER_ID,
+        type: 'fill',
+        source: FOOTPRINT_SOURCE_ID,
+        paint: {
+          'fill-color': '#0078d4',
+          'fill-opacity': 0.1,
+        },
+      });
+    }
+
+    if (!this._map.getLayer(FOOTPRINT_OUTLINE_LAYER_ID)) {
+      this._map.addLayer({
+        id: FOOTPRINT_OUTLINE_LAYER_ID,
+        type: 'line',
+        source: FOOTPRINT_SOURCE_ID,
+        paint: {
+          'line-color': '#0078d4',
+          'line-width': 1.5,
+          'line-opacity': 0.75,
+        },
+      });
+    }
+
+    if (!this._map.getLayer(FOOTPRINT_SELECTED_FILL_LAYER_ID)) {
+      this._map.addLayer({
+        id: FOOTPRINT_SELECTED_FILL_LAYER_ID,
+        type: 'fill',
+        source: FOOTPRINT_SOURCE_ID,
+        filter: ['==', ['get', 'itemId'], ''],
+        paint: {
+          'fill-color': '#ffb900',
+          'fill-opacity': 0.24,
+        },
+      });
+    }
+
+    if (!this._map.getLayer(FOOTPRINT_SELECTED_OUTLINE_LAYER_ID)) {
+      this._map.addLayer({
+        id: FOOTPRINT_SELECTED_OUTLINE_LAYER_ID,
+        type: 'line',
+        source: FOOTPRINT_SOURCE_ID,
+        filter: ['==', ['get', 'itemId'], ''],
+        paint: {
+          'line-color': '#ff8c00',
+          'line-width': 3,
+          'line-opacity': 0.95,
+        },
+      });
+    }
+  }
+
+  /**
+   * Binds map interactions for selecting footprint features.
+   */
+  private _bindFootprintInteractions(): void {
+    if (!this._map || this._footprintClickHandler) return;
+
+    this._footprintClickHandler = (event: MapLayerMouseEvent) => {
+      if (this._state.bboxSelectorActive || this._inspectorLayerId) return;
+
+      const itemId = event.features?.[0]?.properties?.itemId;
+      if (typeof itemId !== 'string') return;
+
+      this._ignoreNextDocumentClick = true;
+      this._selectSearchResult(itemId, { fromMap: true });
+    };
+
+    this._footprintMouseEnterHandler = () => {
+      if (this._mapContainer && !this._state.bboxSelectorActive && !this._inspectorLayerId) {
+        this._mapContainer.style.cursor = 'pointer';
+      }
+    };
+
+    this._footprintMouseLeaveHandler = () => {
+      if (this._mapContainer && !this._state.bboxSelectorActive && !this._inspectorLayerId) {
+        this._mapContainer.style.cursor = '';
+      }
+    };
+
+    this._map.on('click', FOOTPRINT_FILL_LAYER_ID, this._footprintClickHandler);
+    this._map.on('mouseenter', FOOTPRINT_FILL_LAYER_ID, this._footprintMouseEnterHandler);
+    this._map.on('mouseleave', FOOTPRINT_FILL_LAYER_ID, this._footprintMouseLeaveHandler);
+  }
+
+  /**
+   * Selects a search result and highlights its footprint.
+   */
+  private _selectSearchResult(itemId: string | null, options: { fromMap?: boolean } = {}): void {
+    this._state.selectedSearchResultId = itemId;
+    this._state.selectedItem = itemId
+      ? this._state.searchResults.find((item) => item.id === itemId) || null
+      : null;
+    this._updateSelectedFootprint();
+    if (options.fromMap && this._state.activeView !== 'results') {
+      this._state.activeView = 'results';
+    }
+
+    this._emit('item:select');
+    this._emit('statechange');
+    this._renderContent();
+
+    if (options.fromMap) {
+      this._scrollSelectedResultIntoView();
+    }
+  }
+
+  /**
+   * Clears only the current search result selection.
+   */
+  private _clearSearchSelection(render = true): void {
+    this._state.selectedSearchResultId = null;
+    this._state.selectedItem = null;
+    this._updateSelectedFootprint();
+    this._emit('statechange');
+
+    if (render) {
+      this._renderContent();
+    }
+  }
+
+  /**
+   * Removes all search footprint overlays from the map.
+   */
+  private _clearSearchFootprints(render = true): void {
+    if (this._map) {
+      if (this._footprintClickHandler) {
+        this._map.off('click', FOOTPRINT_FILL_LAYER_ID, this._footprintClickHandler);
+      }
+      if (this._footprintMouseEnterHandler) {
+        this._map.off('mouseenter', FOOTPRINT_FILL_LAYER_ID, this._footprintMouseEnterHandler);
+      }
+      if (this._footprintMouseLeaveHandler) {
+        this._map.off('mouseleave', FOOTPRINT_FILL_LAYER_ID, this._footprintMouseLeaveHandler);
+      }
+
+      [
+        FOOTPRINT_SELECTED_OUTLINE_LAYER_ID,
+        FOOTPRINT_SELECTED_FILL_LAYER_ID,
+        FOOTPRINT_OUTLINE_LAYER_ID,
+        FOOTPRINT_FILL_LAYER_ID,
+      ].forEach((layerId) => {
+        if (this._map?.getLayer(layerId)) {
+          this._map.removeLayer(layerId);
+        }
+      });
+
+      if (this._map.getSource(FOOTPRINT_SOURCE_ID)) {
+        this._map.removeSource(FOOTPRINT_SOURCE_ID);
+      }
+    }
+
+    this._footprintClickHandler = null;
+    this._footprintMouseEnterHandler = null;
+    this._footprintMouseLeaveHandler = null;
+    this._mapContainer?.style.removeProperty('cursor');
+    this._state.selectedSearchResultId = null;
+    this._state.selectedItem = null;
+
+    if (render) {
+      this._emit('statechange');
+      this._renderContent();
+    }
+  }
+
+  /**
+   * Updates the highlighted footprint filter.
+   */
+  private _updateSelectedFootprint(): void {
+    if (!this._map) return;
+
+    const itemId = this._state.selectedSearchResultId || '';
+    const filter: ['==', ['get', string], string] = ['==', ['get', 'itemId'], itemId];
+
+    if (this._map.getLayer(FOOTPRINT_SELECTED_FILL_LAYER_ID)) {
+      this._map.setFilter(FOOTPRINT_SELECTED_FILL_LAYER_ID, filter);
+    }
+    if (this._map.getLayer(FOOTPRINT_SELECTED_OUTLINE_LAYER_ID)) {
+      this._map.setFilter(FOOTPRINT_SELECTED_OUTLINE_LAYER_ID, filter);
+    }
+  }
+
+  /**
+   * Converts a STAC item to a footprint feature.
+   */
+  private _itemToFootprintFeature(item: STACItem): FootprintFeature | null {
+    const geometry = item.geometry || this._bboxToPolygon(item.bbox);
+    if (!geometry) return null;
+
+    return {
+      type: 'Feature',
+      id: item.id,
+      geometry,
+      properties: {
+        itemId: item.id,
+        title: item.id,
+      },
+    };
+  }
+
+  /**
+   * Converts a bbox to a polygon geometry.
+   */
+  private _bboxToPolygon(bbox?: number[]): Polygon | null {
+    if (!bbox || bbox.length < 4) return null;
+
+    const [west, south, east, north] = bbox;
+    if (![west, south, east, north].every((value) => Number.isFinite(value))) {
+      return null;
+    }
+
+    return {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [west, south],
+          [east, south],
+          [east, north],
+          [west, north],
+          [west, south],
+        ],
+      ],
+    };
+  }
+
+  /**
+   * Scrolls the selected result row into view.
+   */
+  private _scrollSelectedResultIntoView(): void {
+    if (!this._state.selectedSearchResultId) return;
+
+    const selectedEl = Array.from(this._contentEl?.querySelectorAll('.pc-result-item') || []).find(
+      (el) => el.getAttribute('data-id') === this._state.selectedSearchResultId
+    );
+    selectedEl?.scrollIntoView({ block: 'nearest' });
+  }
+
+  /**
    * Renders results view.
    */
   private _renderResults(): void {
@@ -1108,6 +1454,7 @@ export class PlanetaryComputerControl implements IControl {
     }
 
     const results = this._state.searchResults;
+    const selectedId = this._state.selectedSearchResultId;
 
     this._contentEl.innerHTML = `
       <div class="pc-results">
@@ -1115,6 +1462,20 @@ export class PlanetaryComputerControl implements IControl {
           <button type="button" class="pc-btn-back">&larr; Back</button>
           <span class="pc-results-count">${results.length} items found</span>
         </div>
+        ${
+          results.length
+            ? `
+        <div class="pc-results-toolbar">
+          <button type="button" class="pc-btn pc-btn-small pc-clear-result-selection" ${selectedId ? '' : 'disabled'}>
+            Clear Selection
+          </button>
+          <button type="button" class="pc-btn pc-btn-small pc-clear-footprints">
+            Clear Footprints
+          </button>
+        </div>
+        `
+            : ''
+        }
         <div class="pc-results-list">
           ${
             results.length === 0
@@ -1122,7 +1483,9 @@ export class PlanetaryComputerControl implements IControl {
               : results
                   .map(
                     (item) => `
-                <div class="pc-result-item" data-id="${item.id}">
+                <div class="pc-result-item${
+                  selectedId === item.id ? ' pc-result-selected' : ''
+                }" data-id="${item.id}">
                   ${
                     item.assets.thumbnail?.href
                       ? `<div class="pc-result-thumbnail"><img src="${item.assets.thumbnail.href}" alt="" loading="lazy"></div>`
@@ -1138,6 +1501,7 @@ export class PlanetaryComputerControl implements IControl {
                     }
                   </div>
                   <div class="pc-result-actions">
+                    <button type="button" class="pc-btn pc-btn-small pc-view-item" title="View details">View</button>
                     <button type="button" class="pc-btn pc-btn-small pc-add-layer" title="Add to map">+</button>
                   </div>
                 </div>
@@ -1153,6 +1517,14 @@ export class PlanetaryComputerControl implements IControl {
       this.setView('search');
     });
 
+    this._contentEl.querySelector('.pc-clear-result-selection')?.addEventListener('click', () => {
+      this._clearSearchSelection();
+    });
+
+    this._contentEl.querySelector('.pc-clear-footprints')?.addEventListener('click', () => {
+      this._clearSearchFootprints();
+    });
+
     this._contentEl.querySelectorAll('.pc-result-item').forEach((el) => {
       const id = el.getAttribute('data-id');
       const item = results.find((i) => i.id === id);
@@ -1164,6 +1536,11 @@ export class PlanetaryComputerControl implements IControl {
         if (layer) {
           this.zoomToLayer(layer.id);
         }
+      });
+
+      el.querySelector('.pc-view-item')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.selectItem(item);
       });
 
       el.addEventListener('click', () => {
@@ -1251,7 +1628,7 @@ export class PlanetaryComputerControl implements IControl {
               : ''
           }
 
-          <div class="pc-custom-viz" ${presets.length ? 'style="display:none"' : ''}>
+          <div class="pc-custom-viz">
             <div class="pc-form-group">
               <label class="pc-label">Asset</label>
               <select class="pc-input pc-asset-select">
@@ -1282,7 +1659,76 @@ export class PlanetaryComputerControl implements IControl {
               <input type="text" class="pc-input pc-expression-input" placeholder="e.g., (B08-B04)/(B08+B04)">
               <small class="pc-hint">Leave empty to use selected asset. Use band math for indices like NDVI.</small>
             </div>
+
+            <details class="pc-advanced-render">
+              <summary>Advanced Rendering</summary>
+
+              <div class="pc-form-group">
+                <label class="pc-label">Tile Output</label>
+                <div class="pc-advanced-grid">
+                  <select class="pc-input pc-tile-format">
+                    <option value="">Default</option>
+                    <option value="png">PNG</option>
+                    <option value="jpg">JPG</option>
+                    <option value="webp">WebP</option>
+                    <option value="pngraw">PNG Raw</option>
+                  </select>
+                  <select class="pc-input pc-tile-scale">
+                    <option value="">1x</option>
+                    <option value="2">2x</option>
+                    <option value="3">3x</option>
+                    <option value="4">4x</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="pc-form-group">
+                <label class="pc-label">Zoom Range</label>
+                <div class="pc-rescale-inputs">
+                  <input type="number" class="pc-input pc-minzoom" placeholder="Min zoom" min="0" max="30">
+                  <span class="pc-rescale-separator">to</span>
+                  <input type="number" class="pc-input pc-maxzoom" placeholder="Max zoom" min="0" max="30">
+                </div>
+              </div>
+
+              <div class="pc-form-group">
+                <label class="pc-label">Color Formula</label>
+                <input type="text" class="pc-input pc-color-formula" placeholder="e.g., gamma rgb 1.8">
+              </div>
+
+              <div class="pc-advanced-grid">
+                <div class="pc-form-group">
+                  <label class="pc-label">Nodata</label>
+                  <input type="number" class="pc-input pc-nodata" placeholder="Auto" step="any">
+                </div>
+                <div class="pc-form-group">
+                  <label class="pc-label">Buffer</label>
+                  <input type="number" class="pc-input pc-buffer" placeholder="0" min="0" step="1">
+                </div>
+              </div>
+
+              <div class="pc-checkbox-group">
+                <label><input type="checkbox" class="pc-unscale"> Unscale</label>
+                <label><input type="checkbox" class="pc-asset-as-band"> Asset as band</label>
+                <label><input type="checkbox" class="pc-return-mask"> Return mask</label>
+              </div>
+            </details>
           </div>
+        </div>
+
+        <div class="pc-details-section">
+          <h4 class="pc-section-title">Data API Tools</h4>
+          <div class="pc-tool-actions">
+            <button type="button" class="pc-btn pc-btn-small pc-load-stats">Statistics</button>
+            <button type="button" class="pc-btn pc-btn-small pc-auto-stretch">Auto Stretch</button>
+            <button type="button" class="pc-btn pc-btn-small pc-show-legend">Legend</button>
+            <button type="button" class="pc-btn pc-btn-small pc-load-tilejson">TileJSON</button>
+            <button type="button" class="pc-btn pc-btn-small pc-export-preview">Preview</button>
+            <button type="button" class="pc-btn pc-btn-small pc-export-bbox" ${
+              this._state.drawnBbox ? '' : 'disabled'
+            }>BBox Image</button>
+          </div>
+          <div class="pc-tool-output pc-stats-output"></div>
         </div>
 
         <div class="pc-details-section">
@@ -1320,7 +1766,43 @@ export class PlanetaryComputerControl implements IControl {
     }
 
     this._contentEl.querySelector('.pc-btn-back')?.addEventListener('click', () => {
-      this.selectItem(null);
+      this._state.activeView = 'results';
+      this._emit('statechange');
+      this._renderContent();
+    });
+
+    const getCurrentRenderParams = (): TileParams => {
+      const presetName = (this._contentEl?.querySelector('.pc-preset-select') as HTMLSelectElement)?.value;
+      const advancedParams = this._getAdvancedRenderParams();
+      if (presetName) {
+        return { ...(presets.find((p) => p.name === presetName)?.params || {}), ...advancedParams };
+      }
+
+      return { ...this._getCustomRenderParams(), ...advancedParams };
+    };
+
+    this._contentEl.querySelector('.pc-load-stats')?.addEventListener('click', async () => {
+      await this._loadItemStatistics(item, getCurrentRenderParams());
+    });
+
+    this._contentEl.querySelector('.pc-auto-stretch')?.addEventListener('click', async () => {
+      await this._autoStretchItem(item, getCurrentRenderParams());
+    });
+
+    this._contentEl.querySelector('.pc-show-legend')?.addEventListener('click', () => {
+      this._showRenderLegend(getCurrentRenderParams());
+    });
+
+    this._contentEl.querySelector('.pc-load-tilejson')?.addEventListener('click', async () => {
+      await this._loadItemTileJSON(item, getCurrentRenderParams());
+    });
+
+    this._contentEl.querySelector('.pc-export-preview')?.addEventListener('click', () => {
+      this._openItemPreview(item, getCurrentRenderParams());
+    });
+
+    this._contentEl.querySelector('.pc-export-bbox')?.addEventListener('click', () => {
+      this._openItemBboxImage(item, getCurrentRenderParams());
     });
 
     this._contentEl.querySelector('.pc-add-to-map')?.addEventListener('click', () => {
@@ -1330,35 +1812,9 @@ export class PlanetaryComputerControl implements IControl {
       if (presetName) {
         // Use preset
         const preset = presets.find((p) => p.name === presetName);
-        layer = this.addItemLayer(item, preset ? { presetName, renderParams: preset.params } : undefined);
+        layer = this.addItemLayer(item, preset ? { presetName, renderParams: getCurrentRenderParams() } : undefined);
       } else {
-        // Use custom visualization params
-        const assetSelect = this._contentEl?.querySelector('.pc-asset-select') as HTMLSelectElement;
-        const rescaleMin = (this._contentEl?.querySelector('.pc-rescale-min') as HTMLInputElement)?.value;
-        const rescaleMax = (this._contentEl?.querySelector('.pc-rescale-max') as HTMLInputElement)?.value;
-        const colormap = (this._contentEl?.querySelector('.pc-colormap-select') as HTMLSelectElement)?.value;
-        const expression = (this._contentEl?.querySelector('.pc-expression-input') as HTMLInputElement)?.value;
-
-        const renderParams: TileParams = {};
-
-        if (assetSelect?.value) {
-          renderParams.assets = [assetSelect.value];
-        }
-
-        if (rescaleMin && rescaleMax) {
-          renderParams.rescale = `${rescaleMin},${rescaleMax}`;
-        }
-
-        if (colormap) {
-          renderParams.colormap_name = colormap;
-        }
-
-        if (expression) {
-          renderParams.expression = expression;
-          delete renderParams.assets; // Expression overrides asset selection
-        }
-
-        layer = this.addItemLayer(item, { renderParams });
+        layer = this.addItemLayer(item, { renderParams: getCurrentRenderParams() });
       }
 
       // Zoom to the added layer
@@ -1384,6 +1840,370 @@ export class PlanetaryComputerControl implements IControl {
   }
 
   /**
+   * Gets custom render parameters from the item detail form.
+   */
+  private _getCustomRenderParams(): TileParams {
+    const assetSelect = this._contentEl?.querySelector('.pc-asset-select') as HTMLSelectElement;
+    const rescaleMin = (this._contentEl?.querySelector('.pc-rescale-min') as HTMLInputElement)?.value;
+    const rescaleMax = (this._contentEl?.querySelector('.pc-rescale-max') as HTMLInputElement)?.value;
+    const colormap = (this._contentEl?.querySelector('.pc-colormap-select') as HTMLSelectElement)?.value;
+    const expression = (this._contentEl?.querySelector('.pc-expression-input') as HTMLInputElement)?.value;
+
+    const renderParams: TileParams = {};
+
+    if (assetSelect?.value) {
+      renderParams.assets = [assetSelect.value];
+    }
+
+    if (rescaleMin && rescaleMax) {
+      renderParams.rescale = `${rescaleMin},${rescaleMax}`;
+    }
+
+    if (colormap) {
+      renderParams.colormap_name = colormap;
+    }
+
+    if (expression) {
+      renderParams.expression = expression;
+      delete renderParams.assets;
+    }
+
+    return renderParams;
+  }
+
+  /**
+   * Gets advanced render parameters from the item detail form.
+   */
+  private _getAdvancedRenderParams(): TileParams {
+    const tileFormat = (this._contentEl?.querySelector('.pc-tile-format') as HTMLSelectElement)?.value;
+    const tileScale = (this._contentEl?.querySelector('.pc-tile-scale') as HTMLSelectElement)?.value;
+    const minzoom = (this._contentEl?.querySelector('.pc-minzoom') as HTMLInputElement)?.value;
+    const maxzoom = (this._contentEl?.querySelector('.pc-maxzoom') as HTMLInputElement)?.value;
+    const colorFormula = (this._contentEl?.querySelector('.pc-color-formula') as HTMLInputElement)?.value;
+    const nodata = (this._contentEl?.querySelector('.pc-nodata') as HTMLInputElement)?.value;
+    const buffer = (this._contentEl?.querySelector('.pc-buffer') as HTMLInputElement)?.value;
+    const unscale = (this._contentEl?.querySelector('.pc-unscale') as HTMLInputElement)?.checked;
+    const assetAsBand = (this._contentEl?.querySelector('.pc-asset-as-band') as HTMLInputElement)?.checked;
+    const returnMask = (this._contentEl?.querySelector('.pc-return-mask') as HTMLInputElement)?.checked;
+
+    const params: TileParams = {};
+
+    if (tileFormat) {
+      params.tile_format = tileFormat as TileParams['tile_format'];
+    }
+    if (tileScale) {
+      params.tile_scale = parseInt(tileScale) as TileParams['tile_scale'];
+    }
+    if (minzoom) {
+      params.minzoom = parseInt(minzoom);
+    }
+    if (maxzoom) {
+      params.maxzoom = parseInt(maxzoom);
+    }
+    if (colorFormula) {
+      params.color_formula = colorFormula;
+    }
+    if (nodata) {
+      params.nodata = parseFloat(nodata);
+    }
+    if (buffer) {
+      params.buffer = parseInt(buffer);
+    }
+    if (unscale) {
+      params.unscale = true;
+    }
+    if (assetAsBand) {
+      params.asset_as_band = true;
+    }
+    if (returnMask) {
+      params.return_mask = true;
+    }
+
+    return params;
+  }
+
+  /**
+   * Loads item statistics and renders them in the item detail panel.
+   */
+  private async _loadItemStatistics(item: STACItem, renderParams: TileParams): Promise<Record<string, unknown> | null> {
+    const collectionId = item.collection;
+    const output = this._contentEl?.querySelector('.pc-stats-output') as HTMLElement;
+    if (!collectionId || !output) return null;
+
+    output.innerHTML = '<div class="pc-tool-loading">Loading statistics...</div>';
+
+    try {
+      const statistics = await this._tilerClient.getItemStatistics(collectionId, item.id, {
+        ...renderParams,
+        histogram_bins: 20,
+        max_size: 1024,
+      });
+      output.innerHTML = this._renderStatisticsOutput(statistics);
+      return statistics;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to load statistics';
+      output.innerHTML = `<div class="pc-tool-error">${this._escapeHtml(errorMessage)}</div>`;
+      return null;
+    }
+  }
+
+  /**
+   * Applies a min/max stretch from item statistics to the custom render form.
+   */
+  private async _autoStretchItem(item: STACItem, renderParams: TileParams): Promise<void> {
+    const statistics = await this._loadItemStatistics(item, renderParams);
+    if (!statistics) return;
+
+    const band = this._findFirstBandStatistics(statistics);
+    const output = this._contentEl?.querySelector('.pc-stats-output') as HTMLElement;
+    if (!band) {
+      if (output) {
+        output.innerHTML = '<div class="pc-tool-error">No numeric band statistics were found.</div>';
+      }
+      return;
+    }
+
+    const presetSelect = this._contentEl?.querySelector('.pc-preset-select') as HTMLSelectElement;
+    const customViz = this._contentEl?.querySelector('.pc-custom-viz') as HTMLElement;
+    const minInput = this._contentEl?.querySelector('.pc-rescale-min') as HTMLInputElement;
+    const maxInput = this._contentEl?.querySelector('.pc-rescale-max') as HTMLInputElement;
+    const assetSelect = this._contentEl?.querySelector('.pc-asset-select') as HTMLSelectElement;
+    const expressionInput = this._contentEl?.querySelector('.pc-expression-input') as HTMLInputElement;
+
+    if (presetSelect) {
+      presetSelect.value = '';
+    }
+    if (customViz) {
+      customViz.style.display = 'flex';
+    }
+    if (renderParams.assets?.[0] && assetSelect) {
+      assetSelect.value = renderParams.assets[0];
+    }
+    if (renderParams.expression && expressionInput) {
+      expressionInput.value = renderParams.expression;
+    }
+    if (minInput) {
+      minInput.value = String(band.stats.min);
+    }
+    if (maxInput) {
+      maxInput.value = String(band.stats.max);
+    }
+
+    if (output) {
+      output.innerHTML = `
+        <div class="pc-tool-success">Applied stretch ${this._formatNumber(band.stats.min)} to ${this._formatNumber(band.stats.max)} from ${this._escapeHtml(band.label)}.</div>
+        ${this._renderStatisticsOutput(statistics)}
+      `;
+    }
+  }
+
+  /**
+   * Opens a rendered item preview in a new browser tab.
+   */
+  private _openItemPreview(item: STACItem, renderParams: TileParams): void {
+    if (!item.collection) return;
+
+    const url = this._tilerClient.getItemPreviewUrl(item.collection, item.id, renderParams);
+    window.open(url, '_blank');
+  }
+
+  /**
+   * Opens a rendered bbox image in a new browser tab.
+   */
+  private _openItemBboxImage(item: STACItem, renderParams: TileParams): void {
+    if (!item.collection || !this._state.drawnBbox) return;
+
+    const url = this._tilerClient.getItemBboxImageUrl(
+      item.collection,
+      item.id,
+      this._state.drawnBbox,
+      { width: 768, height: 512 },
+      renderParams
+    );
+    window.open(url, '_blank');
+  }
+
+  /**
+   * Shows the legend for the current named colormap.
+   */
+  private _showRenderLegend(renderParams: TileParams): void {
+    const output = this._contentEl?.querySelector('.pc-stats-output') as HTMLElement;
+    if (!output) return;
+
+    if (!renderParams.colormap_name) {
+      output.innerHTML = '<div class="pc-tool-error">Choose a named colormap to generate a legend.</div>';
+      return;
+    }
+
+    output.innerHTML = this._renderLegend(renderParams.colormap_name);
+  }
+
+  /**
+   * Loads and renders TileJSON metadata for an item.
+   */
+  private async _loadItemTileJSON(item: STACItem, renderParams: TileParams): Promise<void> {
+    const collectionId = item.collection;
+    const output = this._contentEl?.querySelector('.pc-stats-output') as HTMLElement;
+    if (!collectionId || !output) return;
+
+    output.innerHTML = '<div class="pc-tool-loading">Loading TileJSON...</div>';
+
+    try {
+      const tilejson = await this._tilerClient.getItemTileJSON(collectionId, item.id, renderParams);
+      const bounds = Array.isArray(tilejson.bounds) ? tilejson.bounds.join(', ') : 'n/a';
+      const center = Array.isArray(tilejson.center) ? tilejson.center.join(', ') : 'n/a';
+      output.innerHTML = `
+        <div class="pc-tilejson-card">
+          <div><span>Bounds</span><strong>${this._escapeHtml(bounds)}</strong></div>
+          <div><span>Center</span><strong>${this._escapeHtml(center)}</strong></div>
+          <div><span>Min Zoom</span><strong>${this._escapeHtml(String(tilejson.minzoom ?? 'n/a'))}</strong></div>
+          <div><span>Max Zoom</span><strong>${this._escapeHtml(String(tilejson.maxzoom ?? 'n/a'))}</strong></div>
+          <div><span>Tiles</span><strong>${this._escapeHtml(String(tilejson.tiles?.length || 0))}</strong></div>
+        </div>
+      `;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to load TileJSON';
+      output.innerHTML = `<div class="pc-tool-error">${this._escapeHtml(errorMessage)}</div>`;
+    }
+  }
+
+  /**
+   * Renders a legend ramp for a named colormap.
+   */
+  private _renderLegend(colormapName: string): string {
+    const gradient = this._getColormapGradient(colormapName);
+    return `
+      <div class="pc-legend-card">
+        <div class="pc-legend-title">${this._escapeHtml(colormapName)}</div>
+        <div class="pc-legend-ramp" style="background:${gradient}"></div>
+        <div class="pc-legend-labels">
+          <span>Low</span>
+          <span>High</span>
+        </div>
+      </div>
+    `;
+  }
+
+  /**
+   * Gets a CSS gradient approximation for a named colormap.
+   */
+  private _getColormapGradient(colormapName: string): string {
+    const gradients: Record<string, string> = {
+      viridis: 'linear-gradient(to right, #440154, #414487, #2a788e, #22a884, #7ad151, #fde725)',
+      plasma: 'linear-gradient(to right, #0d0887, #6a00a8, #b12a90, #e16462, #fca636, #f0f921)',
+      inferno: 'linear-gradient(to right, #000004, #420a68, #932667, #dd513a, #fca50a, #fcffa4)',
+      magma: 'linear-gradient(to right, #000004, #3b0f70, #8c2981, #de4968, #fe9f6d, #fcfdbf)',
+      cividis: 'linear-gradient(to right, #00204c, #424086, #6c6f7c, #9b9e67, #d6d04d, #ffffe5)',
+      terrain: 'linear-gradient(to right, #333399, #00a6ca, #4ac16d, #f5d76e, #b07d45, #ffffff)',
+      rdylgn: 'linear-gradient(to right, #a50026, #f46d43, #fee08b, #ffffbf, #d9ef8b, #66bd63, #006837)',
+      rdylbu: 'linear-gradient(to right, #a50026, #f46d43, #fee090, #ffffbf, #e0f3f8, #74add1, #313695)',
+      spectral: 'linear-gradient(to right, #9e0142, #d53e4f, #f46d43, #fee08b, #ffffbf, #e6f598, #66c2a5, #3288bd, #5e4fa2)',
+      coolwarm: 'linear-gradient(to right, #3b4cc0, #7093f3, #dddcdc, #f7a889, #b40426)',
+      blues: 'linear-gradient(to right, #f7fbff, #deebf7, #9ecae1, #4292c6, #084594)',
+      greens: 'linear-gradient(to right, #f7fcf5, #c7e9c0, #74c476, #238b45, #00441b)',
+      reds: 'linear-gradient(to right, #fff5f0, #fcbba1, #fb6a4a, #cb181d, #67000d)',
+      greys: 'linear-gradient(to right, #ffffff, #d9d9d9, #969696, #525252, #000000)',
+      ylgnbu: 'linear-gradient(to right, #ffffd9, #c7e9b4, #41b6c4, #2c7fb8, #081d58)',
+      rainbow: 'linear-gradient(to right, #6e40aa, #4776d0, #1f9e89, #6cc24a, #f5d547, #f98e2b, #d23b3b)',
+    };
+
+    return gradients[colormapName] || 'linear-gradient(to right, #000000, #ffffff)';
+  }
+
+  /**
+   * Finds the first numeric band statistics object in a Data API response.
+   */
+  private _findFirstBandStatistics(data: unknown, label: string = 'band'): { label: string; stats: BandStatistics } | null {
+    if (!data || typeof data !== 'object') return null;
+
+    const record = data as Record<string, unknown>;
+    if (
+      typeof record.min === 'number' &&
+      typeof record.max === 'number' &&
+      typeof record.mean === 'number'
+    ) {
+      return { label, stats: record as BandStatistics };
+    }
+
+    for (const [key, value] of Object.entries(record)) {
+      const found = this._findFirstBandStatistics(value, key);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  /**
+   * Renders a compact statistics panel.
+   */
+  private _renderStatisticsOutput(statistics: Record<string, unknown>): string {
+    const band = this._findFirstBandStatistics(statistics);
+    if (!band) {
+      return '<div class="pc-tool-error">No numeric band statistics were found.</div>';
+    }
+
+    const stats = band.stats;
+    return `
+      <div class="pc-stats-card">
+        <div class="pc-stats-title">${this._escapeHtml(band.label)}</div>
+        <div class="pc-stats-grid">
+          <div><span>Min</span><strong>${this._formatNumber(stats.min)}</strong></div>
+          <div><span>Max</span><strong>${this._formatNumber(stats.max)}</strong></div>
+          <div><span>Mean</span><strong>${this._formatNumber(stats.mean)}</strong></div>
+          <div><span>Std</span><strong>${this._formatNumber(stats.std)}</strong></div>
+          <div><span>Valid</span><strong>${this._formatNumber(stats.valid_percent)}%</strong></div>
+          <div><span>Pixels</span><strong>${this._formatNumber(stats.valid_pixels)}</strong></div>
+        </div>
+        ${this._renderHistogram(stats)}
+      </div>
+    `;
+  }
+
+  /**
+   * Renders a tiny histogram from band statistics.
+   */
+  private _renderHistogram(stats: BandStatistics): string {
+    const counts = stats.histogram?.[0];
+    if (!Array.isArray(counts) || counts.length === 0) return '';
+
+    const maxCount = Math.max(...counts.map((count) => Number(count) || 0));
+    if (maxCount <= 0) return '';
+
+    return `
+      <div class="pc-histogram" aria-label="Histogram">
+        ${counts
+          .map((count) => {
+            const height = Math.max(2, Math.round(((Number(count) || 0) / maxCount) * 36));
+            return `<span style="height:${height}px"></span>`;
+          })
+          .join('')}
+      </div>
+    `;
+  }
+
+  /**
+   * Formats numeric output for compact display.
+   */
+  private _formatNumber(value: unknown): string {
+    if (typeof value !== 'number' || !isFinite(value)) return 'n/a';
+    if (Math.abs(value) >= 1000) return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    if (Math.abs(value) >= 10) return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  }
+
+  /**
+   * Escapes text for HTML rendering.
+   */
+  private _escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  /**
    * Renders layers view.
    */
   private _renderLayers(): void {
@@ -1403,6 +2223,7 @@ export class PlanetaryComputerControl implements IControl {
 
     this._contentEl.innerHTML = `
       <div class="pc-layers-list">
+        ${this._renderInspectorOutput()}
         ${layers
           .map(
             (layer) => `
@@ -1412,6 +2233,36 @@ export class PlanetaryComputerControl implements IControl {
               <span class="pc-layer-name" title="${layer.item?.id || layer.collection?.title || layer.id}">
                 ${layer.item?.id || layer.collection?.title || layer.id}
               </span>
+              <button type="button" class="pc-btn-icon pc-toggle-layer-controls${
+                layer.showControls ? ' pc-layer-controls-active' : ''
+              }" title="${layer.showControls ? 'Hide opacity and colormap' : 'Show opacity and colormap'}">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M4 21v-7"/>
+                  <path d="M4 10V3"/>
+                  <path d="M12 21v-9"/>
+                  <path d="M12 8V3"/>
+                  <path d="M20 21v-5"/>
+                  <path d="M20 12V3"/>
+                  <path d="M2 14h4"/>
+                  <path d="M10 8h4"/>
+                  <path d="M18 16h4"/>
+                </svg>
+              </button>
+              ${
+                layer.item
+                  ? `<button type="button" class="pc-btn-icon pc-inspect-layer${
+                      this._inspectorLayerId === layer.id ? ' pc-inspect-active' : ''
+                    }" title="${this._inspectorLayerId === layer.id ? 'Stop inspecting' : 'Inspect pixel values'}">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2v4"/>
+                  <path d="M12 18v4"/>
+                  <path d="M2 12h4"/>
+                  <path d="M18 12h4"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>`
+                  : ''
+              }
               <button type="button" class="pc-btn-icon pc-zoom-to" title="Zoom to layer">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="11" cy="11" r="8"/>
@@ -1420,11 +2271,12 @@ export class PlanetaryComputerControl implements IControl {
               </button>
               <button type="button" class="pc-btn-icon pc-remove-layer" title="Remove">&times;</button>
             </div>
-            <div class="pc-layer-controls">
+            <div class="pc-layer-controls${layer.showControls ? '' : ' pc-layer-controls-hidden'}">
               <label class="pc-opacity-label">
                 Opacity: <span class="pc-opacity-value">${Math.round(layer.opacity * 100)}%</span>
               </label>
               <input type="range" class="pc-opacity-slider" min="0" max="100" value="${Math.round(layer.opacity * 100)}">
+              ${layer.renderParams.colormap_name ? this._renderLegend(layer.renderParams.colormap_name) : ''}
             </div>
           </div>
         `
@@ -1445,6 +2297,12 @@ export class PlanetaryComputerControl implements IControl {
         this.updateLayer(layerId, { visible: visibility.checked });
       });
 
+      el.querySelector('.pc-toggle-layer-controls')?.addEventListener('click', () => {
+        const layer = this._state.activeLayers.find((activeLayer) => activeLayer.id === layerId);
+        this.updateLayer(layerId, { showControls: !layer?.showControls });
+        this._renderContent();
+      });
+
       slider?.addEventListener('input', () => {
         const opacity = parseInt(slider.value) / 100;
         opacityValue.textContent = `${slider.value}%`;
@@ -1458,7 +2316,227 @@ export class PlanetaryComputerControl implements IControl {
       el.querySelector('.pc-remove-layer')?.addEventListener('click', () => {
         this.removeLayer(layerId);
       });
+
+      el.querySelector('.pc-inspect-layer')?.addEventListener('click', () => {
+        if (this._inspectorLayerId === layerId) {
+          this._stopInspector();
+        } else {
+          this._startInspector(layerId);
+        }
+      });
     });
+  }
+
+  /**
+   * Starts map click inspection for an item layer.
+   */
+  private _startInspector(layerId: string): void {
+    if (!this._map || !this._layerManager) return;
+
+    const layer = this._layerManager.getLayer(layerId);
+    if (!layer?.item?.collection) return;
+
+    this._stopInspector(false);
+    this._inspectorLayerId = layerId;
+    this._inspectorResult = null;
+    this._mapContainer?.classList.add('pc-inspector-active');
+
+    this._inspectClickHandler = (event: MapMouseEvent) => {
+      this._queryInspectorPoint(layerId, event.lngLat.lng, event.lngLat.lat);
+    };
+
+    this._map.on('click', this._inspectClickHandler);
+    this._renderContent();
+  }
+
+  /**
+   * Stops map click inspection.
+   */
+  private _stopInspector(render = true): void {
+    if (this._inspectClickHandler && this._map) {
+      this._map.off('click', this._inspectClickHandler);
+    }
+
+    this._inspectClickHandler = null;
+    this._inspectorLayerId = null;
+    this._inspectorResult = null;
+    this._mapContainer?.classList.remove('pc-inspector-active');
+
+    if (render) {
+      this._renderContent();
+    }
+  }
+
+  /**
+   * Queries Data API point values for the active inspector layer.
+   */
+  private async _queryInspectorPoint(layerId: string, lon: number, lat: number): Promise<void> {
+    const layer = this._layerManager?.getLayer(layerId);
+    if (!layer?.item?.collection) return;
+
+    if (!this._itemBboxContainsPoint(layer.item, lon, lat)) {
+      this._inspectorResult = {
+        layerId,
+        lon,
+        lat,
+        loading: false,
+        error: 'Clicked outside this item footprint. Click inside the visible footprint to inspect pixel values.',
+      };
+      this._renderContent();
+      return;
+    }
+
+    this._inspectorResult = {
+      layerId,
+      lon,
+      lat,
+      loading: true,
+    };
+    this._renderContent();
+
+    try {
+      const data = await this._tilerClient.getItemPoint(
+        layer.item.collection,
+        layer.item.id,
+        lon,
+        lat,
+        layer.renderParams
+      );
+
+      if (this._inspectorLayerId !== layerId) return;
+
+      this._inspectorResult = {
+        layerId,
+        lon,
+        lat,
+        loading: false,
+        data,
+      };
+    } catch (error) {
+      if (this._inspectorLayerId !== layerId) return;
+
+      this._inspectorResult = {
+        layerId,
+        lon,
+        lat,
+        loading: false,
+        error: this._getInspectorErrorMessage(error),
+      };
+    }
+
+    this._renderContent();
+  }
+
+  /**
+   * Checks whether a coordinate is inside a STAC item's bbox.
+   */
+  private _itemBboxContainsPoint(item: STACItem, lon: number, lat: number): boolean {
+    if (!item.bbox || item.bbox.length < 4) return true;
+
+    const [west, south, east, north] = item.bbox;
+    if (![west, south, east, north].every((value) => Number.isFinite(value))) return true;
+
+    return lon >= west && lon <= east && lat >= south && lat <= north;
+  }
+
+  /**
+   * Converts point query failures into user-facing inspector messages.
+   */
+  private _getInspectorErrorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message.trim() : '';
+
+    if (!message || message === 'Failed to get point values:' || message === 'Failed to get point values') {
+      return 'No pixel value was returned for this location. Try a point inside the layer footprint and away from nodata areas.';
+    }
+
+    if (/not found|outside|bounds|intersect|empty|no data|nodata/i.test(message)) {
+      return 'No pixel value is available at this location. The click may be outside valid data or over a nodata pixel.';
+    }
+
+    return message;
+  }
+
+  /**
+   * Renders pixel inspector status and results.
+   */
+  private _renderInspectorOutput(): string {
+    if (!this._inspectorLayerId) return '';
+
+    const layer = this._state.activeLayers.find((activeLayer) => activeLayer.id === this._inspectorLayerId);
+    const layerName = layer?.item?.id || layer?.id || this._inspectorLayerId;
+    const result = this._inspectorResult;
+
+    if (!result) {
+      return `
+        <div class="pc-inspector-panel">
+          <div class="pc-inspector-title">Inspecting ${this._escapeHtml(layerName)}</div>
+          <div class="pc-inspector-hint">Click the map to query pixel values.</div>
+        </div>
+      `;
+    }
+
+    if (result.loading) {
+      return `
+        <div class="pc-inspector-panel">
+          <div class="pc-inspector-title">Inspecting ${this._escapeHtml(layerName)}</div>
+          <div class="pc-tool-loading">Querying ${this._formatNumber(result.lon)}, ${this._formatNumber(result.lat)}...</div>
+        </div>
+      `;
+    }
+
+    if (result.error) {
+      return `
+        <div class="pc-inspector-panel">
+          <div class="pc-inspector-title">Inspecting ${this._escapeHtml(layerName)}</div>
+          <div class="pc-tool-error">${this._escapeHtml(result.error)}</div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="pc-inspector-panel">
+        <div class="pc-inspector-title">Inspecting ${this._escapeHtml(layerName)}</div>
+        <div class="pc-inspector-coords">${this._formatNumber(result.lon)}, ${this._formatNumber(result.lat)}</div>
+        ${this._renderPointValues(result.data)}
+      </div>
+    `;
+  }
+
+  /**
+   * Renders point values from a Data API point response.
+   */
+  private _renderPointValues(data?: PointValueResponse): string {
+    if (!data) return '';
+
+    if (Array.isArray(data.values)) {
+      return `
+        <div class="pc-point-values">
+          ${data.values
+            .map((value, index) => {
+              const label = data.band_names?.[index] || `Band ${index + 1}`;
+              return `
+                <div>
+                  <span>${this._escapeHtml(label)}</span>
+                  <strong>${this._escapeHtml(this._formatPointValue(value))}</strong>
+                </div>
+              `;
+            })
+            .join('')}
+        </div>
+      `;
+    }
+
+    return `<pre class="pc-point-json">${this._escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  }
+
+  /**
+   * Formats a point value.
+   */
+  private _formatPointValue(value: unknown): string {
+    if (typeof value === 'number') return this._formatNumber(value);
+    if (value === null || value === undefined) return 'n/a';
+    if (Array.isArray(value)) return value.map((entry) => this._formatPointValue(entry)).join(', ');
+    return String(value);
   }
 
   /**
@@ -1524,7 +2602,7 @@ export class PlanetaryComputerControl implements IControl {
         this._ignoreNextDocumentClick = false;
         return;
       }
-      if (this._state.bboxSelectorActive) return;
+      if (this._state.bboxSelectorActive || this._inspectorLayerId) return;
 
       const target = e.target as Node;
       if (
