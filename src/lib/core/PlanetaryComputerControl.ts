@@ -38,6 +38,11 @@ const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
  */
 type EventHandlersMap = globalThis.Map<PlanetaryComputerEvent, Set<PlanetaryComputerEventHandler>>;
 
+type ScreenPoint = {
+  x: number;
+  y: number;
+};
+
 /**
  * MapLibre GL control for browsing and visualizing Planetary Computer data.
  *
@@ -74,6 +79,16 @@ export class PlanetaryComputerControl implements IControl {
   private _resizeHandler: (() => void) | null = null;
   private _mapResizeHandler: (() => void) | null = null;
   private _clickOutsideHandler: ((e: MouseEvent) => void) | null = null;
+  private _bboxPointerDownHandler: ((e: PointerEvent) => void) | null = null;
+  private _bboxPointerMoveHandler: ((e: PointerEvent) => void) | null = null;
+  private _bboxPointerUpHandler: ((e: PointerEvent) => void) | null = null;
+  private _bboxKeyDownHandler: ((e: KeyboardEvent) => void) | null = null;
+  private _bboxOverlay?: HTMLElement;
+  private _bboxBox?: HTMLElement;
+  private _bboxStartPoint: ScreenPoint | null = null;
+  private _bboxDragPanWasEnabled = false;
+  private _bboxBoxZoomWasEnabled = false;
+  private _ignoreNextDocumentClick = false;
 
   /**
    * Creates a new PlanetaryComputerControl instance.
@@ -124,6 +139,8 @@ export class PlanetaryComputerControl implements IControl {
    * Called when the control is removed from the map.
    */
   onRemove(): void {
+    this._stopBboxDraw(false);
+
     // Remove event listeners
     if (this._resizeHandler) {
       window.removeEventListener('resize', this._resizeHandler);
@@ -168,6 +185,10 @@ export class PlanetaryComputerControl implements IControl {
    * Toggles the collapsed state of the control panel.
    */
   toggle(): void {
+    if (!this._state.collapsed) {
+      this._stopBboxDraw(false);
+    }
+
     this._state.collapsed = !this._state.collapsed;
     this._updatePanelVisibility();
     this._emit(this._state.collapsed ? 'collapse' : 'expand');
@@ -345,6 +366,7 @@ export class PlanetaryComputerControl implements IControl {
    * @param collection - Collection to select.
    */
   selectCollection(collection: STACCollection | null): void {
+    this._stopBboxDraw(false);
     this._state.selectedCollection = collection;
     this._state.searchParams = collection ? { collections: [collection.id] } : {};
     this._state.activeView = collection ? 'search' : 'collections';
@@ -691,10 +713,28 @@ export class PlanetaryComputerControl implements IControl {
         <div class="pc-form-group">
           <label class="pc-label">Bounding Box</label>
           <div class="pc-bbox-display">
-            <span class="pc-bbox-text">${
-              this._state.drawnBbox ? formatBbox(this._state.drawnBbox) : 'Use current map view'
-            }</span>
-            <button type="button" class="pc-btn pc-btn-small pc-use-view">Use Map View</button>
+            <div class="pc-bbox-actions">
+              ${
+                this._options.enableBboxSelector
+                  ? `<button type="button" class="pc-btn pc-btn-small pc-draw-bbox${
+                      this._state.bboxSelectorActive ? ' pc-btn-active' : ''
+                    }">${this._state.bboxSelectorActive ? 'Cancel Draw' : 'Draw Bbox'}</button>`
+                  : ''
+              }
+              <button type="button" class="pc-btn pc-btn-small pc-use-view">Use Map View</button>
+              <button type="button" class="pc-btn pc-btn-small pc-clear-bbox" ${
+                this._state.drawnBbox ? '' : 'disabled'
+              }>Clear</button>
+            </div>
+            <div class="pc-bbox-coordinates">
+              <span class="pc-bbox-text">${
+                this._state.bboxSelectorActive
+                  ? 'Drag on the map to draw a bounding box'
+                  : this._state.drawnBbox
+                    ? formatBbox(this._state.drawnBbox)
+                    : 'Use current map view'
+              }</span>
+            </div>
           </div>
         </div>
 
@@ -765,6 +805,7 @@ export class PlanetaryComputerControl implements IControl {
 
     this._contentEl.querySelector('.pc-use-view')?.addEventListener('click', () => {
       if (this._map) {
+        this._stopBboxDraw(false);
         const bounds = this._map.getBounds();
         this._state.drawnBbox = [
           bounds.getWest(),
@@ -774,6 +815,22 @@ export class PlanetaryComputerControl implements IControl {
         ];
         this._state.searchParams.bbox = this._state.drawnBbox;
         this._renderContent();
+      }
+    });
+
+    this._contentEl.querySelector('.pc-clear-bbox')?.addEventListener('click', () => {
+      this._stopBboxDraw(false);
+      this._state.drawnBbox = null;
+      delete this._state.searchParams.bbox;
+      this._emit('statechange');
+      this._renderContent();
+    });
+
+    this._contentEl.querySelector('.pc-draw-bbox')?.addEventListener('click', () => {
+      if (this._state.bboxSelectorActive) {
+        this._stopBboxDraw();
+      } else {
+        this._startBboxDraw();
       }
     });
 
@@ -859,6 +916,179 @@ export class PlanetaryComputerControl implements IControl {
     }
 
     return false;
+  }
+
+  /**
+   * Starts interactive map bounding box drawing.
+   */
+  private _startBboxDraw(): void {
+    if (!this._map || !this._mapContainer || !this._options.enableBboxSelector) return;
+
+    this._stopBboxDraw(false);
+    this._state.bboxSelectorActive = true;
+    this._bboxStartPoint = null;
+    this._bboxDragPanWasEnabled = this._map.dragPan.isEnabled();
+    this._bboxBoxZoomWasEnabled = this._map.boxZoom.isEnabled();
+    this._map.dragPan.disable();
+    this._map.boxZoom.disable();
+
+    this._mapContainer.classList.add('pc-bbox-drawing');
+
+    this._bboxOverlay = document.createElement('div');
+    this._bboxOverlay.className = 'pc-bbox-overlay';
+    this._bboxOverlay.innerHTML = '<div class="pc-bbox-instructions">Drag on the map to draw a bounding box</div>';
+
+    this._bboxBox = document.createElement('div');
+    this._bboxBox.className = 'pc-bbox-box';
+    this._bboxOverlay.appendChild(this._bboxBox);
+    this._mapContainer.appendChild(this._bboxOverlay);
+
+    this._bboxPointerDownHandler = (event: PointerEvent) => {
+      if (event.button !== 0 || !this._mapContainer) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      this._ignoreNextDocumentClick = true;
+      this._bboxStartPoint = this._getPointerPoint(event);
+      this._updateBboxBox(this._bboxStartPoint, this._bboxStartPoint);
+    };
+
+    this._bboxPointerMoveHandler = (event: PointerEvent) => {
+      if (!this._bboxStartPoint) return;
+
+      event.preventDefault();
+      this._updateBboxBox(this._bboxStartPoint, this._getPointerPoint(event));
+    };
+
+    this._bboxPointerUpHandler = (event: PointerEvent) => {
+      if (!this._bboxStartPoint || !this._map) return;
+
+      event.preventDefault();
+      this._ignoreNextDocumentClick = true;
+
+      const endPoint = this._getPointerPoint(event);
+      const left = Math.min(this._bboxStartPoint.x, endPoint.x);
+      const right = Math.max(this._bboxStartPoint.x, endPoint.x);
+      const top = Math.min(this._bboxStartPoint.y, endPoint.y);
+      const bottom = Math.max(this._bboxStartPoint.y, endPoint.y);
+
+      if (right - left < 4 || bottom - top < 4) {
+        this._bboxStartPoint = null;
+        if (this._bboxBox) {
+          this._bboxBox.style.display = 'none';
+        }
+        return;
+      }
+
+      const southwest = this._map.unproject([left, bottom]);
+      const northeast = this._map.unproject([right, top]);
+      const bbox: [number, number, number, number] = [
+        Math.min(southwest.lng, northeast.lng),
+        Math.min(southwest.lat, northeast.lat),
+        Math.max(southwest.lng, northeast.lng),
+        Math.max(southwest.lat, northeast.lat),
+      ];
+
+      this._state.drawnBbox = bbox;
+      this._state.searchParams.bbox = bbox;
+      this._stopBboxDraw(false);
+      this._emit('bbox:complete', bbox);
+      this._emit('statechange');
+      this._renderContent();
+    };
+
+    this._bboxKeyDownHandler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        this._stopBboxDraw();
+      }
+    };
+
+    this._mapContainer.addEventListener('pointerdown', this._bboxPointerDownHandler);
+    window.addEventListener('pointermove', this._bboxPointerMoveHandler);
+    window.addEventListener('pointerup', this._bboxPointerUpHandler);
+    document.addEventListener('keydown', this._bboxKeyDownHandler);
+
+    this._emit('bbox:start');
+    this._emit('statechange');
+    this._renderContent();
+  }
+
+  /**
+   * Stops interactive bounding box drawing and restores map input.
+   */
+  private _stopBboxDraw(render = true): void {
+    if (this._bboxPointerDownHandler && this._mapContainer) {
+      this._mapContainer.removeEventListener('pointerdown', this._bboxPointerDownHandler);
+    }
+    if (this._bboxPointerMoveHandler) {
+      window.removeEventListener('pointermove', this._bboxPointerMoveHandler);
+    }
+    if (this._bboxPointerUpHandler) {
+      window.removeEventListener('pointerup', this._bboxPointerUpHandler);
+    }
+    if (this._bboxKeyDownHandler) {
+      document.removeEventListener('keydown', this._bboxKeyDownHandler);
+    }
+
+    this._bboxPointerDownHandler = null;
+    this._bboxPointerMoveHandler = null;
+    this._bboxPointerUpHandler = null;
+    this._bboxKeyDownHandler = null;
+    this._bboxStartPoint = null;
+
+    this._bboxOverlay?.parentNode?.removeChild(this._bboxOverlay);
+    this._bboxOverlay = undefined;
+    this._bboxBox = undefined;
+
+    this._mapContainer?.classList.remove('pc-bbox-drawing');
+
+    if (this._map) {
+      if (this._bboxDragPanWasEnabled && !this._map.dragPan.isEnabled()) {
+        this._map.dragPan.enable();
+      }
+      if (this._bboxBoxZoomWasEnabled && !this._map.boxZoom.isEnabled()) {
+        this._map.boxZoom.enable();
+      }
+    }
+
+    if (!this._state.bboxSelectorActive) return;
+
+    this._state.bboxSelectorActive = false;
+    this._emit('statechange');
+    if (render) {
+      this._renderContent();
+    }
+  }
+
+  /**
+   * Gets a pointer location relative to the map container.
+   */
+  private _getPointerPoint(event: PointerEvent): ScreenPoint {
+    const rect = this._mapContainer?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+  }
+
+  /**
+   * Updates the visible bounding box rectangle.
+   */
+  private _updateBboxBox(startPoint: ScreenPoint, endPoint: ScreenPoint): void {
+    if (!this._bboxBox) return;
+
+    const left = Math.min(startPoint.x, endPoint.x);
+    const top = Math.min(startPoint.y, endPoint.y);
+    const width = Math.abs(startPoint.x - endPoint.x);
+    const height = Math.abs(startPoint.y - endPoint.y);
+
+    this._bboxBox.style.display = 'block';
+    this._bboxBox.style.left = `${left}px`;
+    this._bboxBox.style.top = `${top}px`;
+    this._bboxBox.style.width = `${width}px`;
+    this._bboxBox.style.height = `${height}px`;
   }
 
   /**
@@ -1290,6 +1520,12 @@ export class PlanetaryComputerControl implements IControl {
    */
   private _setupEventListeners(): void {
     this._clickOutsideHandler = (e: MouseEvent) => {
+      if (this._ignoreNextDocumentClick) {
+        this._ignoreNextDocumentClick = false;
+        return;
+      }
+      if (this._state.bboxSelectorActive) return;
+
       const target = e.target as Node;
       if (
         this._container &&
