@@ -9,7 +9,9 @@ import {
   classNames,
   isValidBbox,
   formatFileSize,
+  toMinimalStacJson,
 } from '../src/lib/utils/helpers';
+import type { STACItem } from '../src/lib/api/types';
 
 describe('generateId', () => {
   it('generates unique IDs', () => {
@@ -156,5 +158,93 @@ describe('formatFileSize', () => {
 
   it('handles zero', () => {
     expect(formatFileSize(0)).toBe('0 Bytes');
+  });
+});
+
+describe('toMinimalStacJson', () => {
+  const makeItem = (overrides: Partial<STACItem> = {}): STACItem =>
+    ({
+      id: 'item-1',
+      type: 'Feature',
+      stac_version: '1.0.0',
+      geometry: { type: 'Polygon', coordinates: [] },
+      bbox: [-98.94, 46.93, -98.87, 47.0],
+      properties: { datetime: '2023-07-02T00:00:00Z' },
+      links: [],
+      assets: {
+        image: {
+          href: 'https://example.com/image.tif',
+          type: 'image/tiff; application=geotiff; profile=cloud-optimized',
+          roles: ['data'],
+        },
+      },
+      ...overrides,
+    }) as STACItem;
+
+  it('keeps only bbox and data asset hrefs', () => {
+    const result = toMinimalStacJson([makeItem()]);
+
+    expect(result).toEqual({
+      type: 'FeatureCollection',
+      features: [
+        {
+          bbox: [-98.94, 46.93, -98.87, 47.0],
+          assets: { image: { href: 'https://example.com/image.tif' } },
+        },
+      ],
+    });
+  });
+
+  it('drops thumbnails, previews, and tile endpoints', () => {
+    const item = makeItem({
+      assets: {
+        image: {
+          href: 'https://example.com/image.tif',
+          type: 'image/tiff; application=geotiff',
+          roles: ['data'],
+        },
+        thumbnail: { href: 'https://example.com/thumb.jpg', type: 'image/jpeg', roles: ['thumbnail'] },
+        tilejson: { href: 'https://example.com/tile.json', type: 'application/json', roles: ['tiles'] },
+        rendered_preview: { href: 'https://example.com/p.png', type: 'image/png', roles: ['overview'] },
+      },
+    });
+
+    expect(Object.keys(toMinimalStacJson([item]).features[0].assets)).toEqual(['image']);
+  });
+
+  it('falls back to media type when roles are absent', () => {
+    const item = makeItem({
+      assets: {
+        band: { href: 'https://example.com/b.tif', type: 'image/tiff; application=geotiff' },
+        meta: { href: 'https://example.com/m.txt', type: 'text/plain' },
+      },
+    });
+
+    expect(Object.keys(toMinimalStacJson([item]).features[0].assets)).toEqual(['band']);
+  });
+
+  it('keeps every data asset when an item has several', () => {
+    const item = makeItem({
+      assets: {
+        B02: { href: 'https://example.com/B02.tif', roles: ['data'] },
+        B03: { href: 'https://example.com/B03.tif', roles: ['data'] },
+      },
+    });
+
+    expect(Object.keys(toMinimalStacJson([item]).features[0].assets)).toEqual(['B02', 'B03']);
+  });
+
+  it('skips items that have no data assets', () => {
+    const item = makeItem({
+      assets: {
+        thumbnail: { href: 'https://example.com/thumb.jpg', type: 'image/jpeg', roles: ['thumbnail'] },
+      },
+    });
+
+    expect(toMinimalStacJson([item]).features).toEqual([]);
+  });
+
+  it('returns an empty FeatureCollection for no items', () => {
+    expect(toMinimalStacJson([])).toEqual({ type: 'FeatureCollection', features: [] });
   });
 });
