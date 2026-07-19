@@ -55,7 +55,7 @@ map.on('load', () => {
     panelWidth: 380,
   });
 
-  map.addControl(pcControl, 'top-right');
+  map.addControl(pcControl, 'top-left');
 
   // Listen for events
   pcControl.on('layer:add', (event) => {

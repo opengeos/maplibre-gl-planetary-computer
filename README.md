@@ -111,6 +111,7 @@ Main control class implementing MapLibre's IControl interface.
 | `position` | `string` | `'top-right'` | Control position on map |
 | `title` | `string` | `'Planetary Computer'` | Panel title |
 | `panelWidth` | `number` | `380` | Panel width in pixels |
+| `maxHeight` | `number` | `0` | Max panel height in pixels; `0` fills the available map height |
 | `stacApiUrl` | `string` | PC default | STAC API base URL |
 | `tilerApiUrl` | `string` | PC default | TiTiler API base URL |
 | `maxSearchResults` | `number` | `50` | Max items per search |

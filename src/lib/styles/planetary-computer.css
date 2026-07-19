@@ -47,10 +47,64 @@
   display: none;
   flex-direction: column;
   overflow: hidden;
+  box-sizing: border-box;
+  /* Height shrinks to fit the content, bounded by the max-height set in JS. */
+  height: auto;
+  max-width: calc(100% - 20px);
 }
 
 .pc-control-panel.expanded {
   display: flex;
+}
+
+/* ============ Resize Handles ============ */
+.pc-resize-handle {
+  position: absolute;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  z-index: 2;
+  touch-action: none;
+}
+
+.pc-resize-handle::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  width: 7px;
+  height: 7px;
+  border-bottom: 2px solid #c4c4c4;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.pc-control-panel:hover .pc-resize-handle::after,
+.pc-control-panel.pc-resizing .pc-resize-handle::after {
+  opacity: 1;
+}
+
+.pc-resize-handle-se {
+  right: 0;
+  cursor: nwse-resize;
+}
+
+.pc-resize-handle-se::after {
+  right: 3px;
+  border-right: 2px solid #c4c4c4;
+}
+
+.pc-resize-handle-sw {
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.pc-resize-handle-sw::after {
+  left: 3px;
+  border-left: 2px solid #c4c4c4;
+}
+
+.pc-control-panel.pc-resizing {
+  user-select: none;
 }
 
 /* ============ Header ============ */
@@ -125,6 +179,7 @@
 /* ============ Content Area ============ */
 .pc-control-content {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px;
 }
