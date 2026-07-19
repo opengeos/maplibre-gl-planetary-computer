@@ -26,7 +26,14 @@ import { STACClient } from '../api/stac-client';
 import { TiTilerClient } from '../api/titiler-client';
 import { SASTokenManager } from '../api/sas-token';
 import { LayerManager } from './LayerManager';
-import { truncate, formatDate, formatBbox, getItemDate, clamp } from '../utils/helpers';
+import {
+  truncate,
+  formatDate,
+  formatBbox,
+  getItemDate,
+  clamp,
+  toMinimalStacJson,
+} from '../utils/helpers';
 import { getPresetsForCollection } from '../api/render-presets';
 
 /**
@@ -467,6 +474,39 @@ export class PlanetaryComputerControl implements IControl {
     this._emit('item:select');
     this._emit('statechange');
     this._renderContent();
+  }
+
+  /**
+   * Downloads the current search results as a minimal STAC JSON file
+   * containing only each item's bbox and data asset hrefs.
+   *
+   * @param filename - Optional filename. Defaults to `<collection>_stac.json`.
+   * @returns The number of items written, or 0 if there was nothing to write.
+   */
+  downloadStacJson(filename?: string): number {
+    const stac = toMinimalStacJson(this._state.searchResults);
+    if (stac.features.length === 0) return 0;
+
+    const collection =
+      this._state.selectedCollection?.id ||
+      this._state.searchResults[0]?.collection ||
+      'stac';
+    const name = filename || `${collection}_stac.json`;
+
+    const blob = new Blob([JSON.stringify(stac)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    // The synthetic click below bubbles to the document, where it would read as
+    // a click outside the panel and collapse it.
+    this._ignoreNextDocumentClick = true;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    return stac.features.length;
   }
 
   /**
@@ -1616,6 +1656,9 @@ export class PlanetaryComputerControl implements IControl {
           <button type="button" class="pc-btn pc-btn-small pc-clear-footprints">
             Clear Footprints
           </button>
+          <button type="button" class="pc-btn pc-btn-small pc-download-stac" title="Download a minimal STAC JSON of the search results">
+            Download STAC JSON
+          </button>
         </div>
         `
             : ''
@@ -1667,6 +1710,10 @@ export class PlanetaryComputerControl implements IControl {
 
     this._contentEl.querySelector('.pc-clear-footprints')?.addEventListener('click', () => {
       this._clearSearchFootprints();
+    });
+
+    this._contentEl.querySelector('.pc-download-stac')?.addEventListener('click', () => {
+      this.downloadStacJson();
     });
 
     this._contentEl.querySelectorAll('.pc-result-item').forEach((el) => {

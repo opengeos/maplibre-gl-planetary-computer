@@ -1,3 +1,21 @@
+import type { STACAsset, STACItem } from '../api/types';
+
+/**
+ * A STAC item stripped down to its bbox and data asset hrefs.
+ */
+export interface MinimalStacFeature {
+  bbox: number[];
+  assets: Record<string, { href: string }>;
+}
+
+/**
+ * A FeatureCollection of {@link MinimalStacFeature}.
+ */
+export interface MinimalStacCollection {
+  type: 'FeatureCollection';
+  features: MinimalStacFeature[];
+}
+
 /**
  * Generates a unique ID with optional prefix.
  *
@@ -158,6 +176,54 @@ export function isValidBbox(
 ): bbox is [number, number, number, number] {
   if (!Array.isArray(bbox) || bbox.length !== 4) return false;
   return bbox.every((v) => typeof v === 'number' && isFinite(v));
+}
+
+/**
+ * Media types that identify an asset as a downloadable raster.
+ * Used as a fallback when items do not declare asset roles.
+ */
+const RASTER_MEDIA_TYPES = ['tiff', 'geotiff', 'cog'];
+
+/**
+ * Checks if an asset holds the item's actual data (as opposed to a thumbnail,
+ * an overview, or a tile endpoint).
+ */
+function isDataAsset(asset: STACAsset): boolean {
+  if (asset.roles?.length) return asset.roles.includes('data');
+  const type = (asset.type || '').toLowerCase();
+  return RASTER_MEDIA_TYPES.some((t) => type.includes(t));
+}
+
+/**
+ * Reduces STAC items to a minimal FeatureCollection holding only each item's
+ * bbox and the hrefs of its data assets.
+ *
+ * The result is a fraction of the size of the full STAC response, which makes
+ * it practical to hand off to tools that only need to know where the source
+ * rasters live (mosaic builders, download scripts, and the like). Items whose
+ * assets are all thumbnails or previews are dropped.
+ *
+ * @param items - STAC items to reduce.
+ * @returns Minimal FeatureCollection.
+ */
+export function toMinimalStacJson(items: STACItem[]): MinimalStacCollection {
+  const features: MinimalStacFeature[] = [];
+
+  for (const item of items) {
+    const assets: Record<string, { href: string }> = {};
+
+    for (const [key, asset] of Object.entries(item.assets ?? {})) {
+      if (asset?.href && isDataAsset(asset)) {
+        assets[key] = { href: asset.href };
+      }
+    }
+
+    if (Object.keys(assets).length === 0) continue;
+
+    features.push({ bbox: item.bbox, assets });
+  }
+
+  return { type: 'FeatureCollection', features };
 }
 
 /**
