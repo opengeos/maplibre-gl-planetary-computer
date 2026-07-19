@@ -32,7 +32,9 @@ export interface PlanetaryComputerOptions {
   /**
    * Maximum height of the control panel in pixels.
    * When content exceeds this height, a vertical scrollbar appears.
-   * @default 500
+   * Defaults to the vertical space available in the map container, so the
+   * panel grows with its content until it reaches the edge of the map.
+   * @default 0 (fill available space)
    */
   maxHeight?: number;
 

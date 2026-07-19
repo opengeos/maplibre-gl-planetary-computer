@@ -26,7 +26,7 @@ import { STACClient } from '../api/stac-client';
 import { TiTilerClient } from '../api/titiler-client';
 import { SASTokenManager } from '../api/sas-token';
 import { LayerManager } from './LayerManager';
-import { truncate, formatDate, formatBbox, getItemDate } from '../utils/helpers';
+import { truncate, formatDate, formatBbox, getItemDate, clamp } from '../utils/helpers';
 import { getPresetsForCollection } from '../api/render-presets';
 
 /**
@@ -37,7 +37,7 @@ const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
   position: 'top-right',
   title: 'Planetary Computer',
   panelWidth: 380,
-  maxHeight: 500,
+  maxHeight: 0,
   className: '',
   stacApiUrl: 'https://planetarycomputer.microsoft.com/api/stac/v1',
   tilerApiUrl: 'https://planetarycomputer.microsoft.com/api/data/v1',
@@ -53,10 +53,34 @@ const FOOTPRINT_OUTLINE_LAYER_ID = 'pc-search-footprints-outline';
 const FOOTPRINT_SELECTED_FILL_LAYER_ID = 'pc-search-footprints-selected-fill';
 const FOOTPRINT_SELECTED_OUTLINE_LAYER_ID = 'pc-search-footprints-selected-outline';
 
+/** Smallest size the panel can be dragged down to, in pixels. */
+const PANEL_MIN_WIDTH = 280;
+const PANEL_MIN_HEIGHT = 200;
+
+/** Gap kept between a resized panel edge and the map container edge. */
+const PANEL_EDGE_MARGIN = 5;
+
 /**
  * Event handlers map type.
  */
 type EventHandlersMap = globalThis.Map<PlanetaryComputerEvent, Set<PlanetaryComputerEventHandler>>;
+
+/** The bottom corners the panel can be resized from. */
+type ResizeCorner = 'se' | 'sw';
+
+/**
+ * Pointer/geometry snapshot taken when a panel resize drag begins.
+ */
+interface PanelResizeState {
+  corner: ResizeCorner;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  startWidth: number;
+  startHeight: number;
+  startLeft: number;
+  startTop: number;
+}
 
 type ScreenPoint = {
   x: number;
@@ -126,6 +150,9 @@ export class PlanetaryComputerControl implements IControl {
   private _footprintClickHandler: ((e: MapLayerMouseEvent) => void) | null = null;
   private _footprintMouseEnterHandler: (() => void) | null = null;
   private _footprintMouseLeaveHandler: (() => void) | null = null;
+  private _resizeState: PanelResizeState | null = null;
+  private _resizePointerMoveHandler: ((e: PointerEvent) => void) | null = null;
+  private _resizePointerUpHandler: ((e: PointerEvent) => void) | null = null;
 
   /**
    * Creates a new PlanetaryComputerControl instance.
@@ -179,6 +206,7 @@ export class PlanetaryComputerControl implements IControl {
     this._stopBboxDraw(false);
     this._stopInspector(false);
     this._clearSearchFootprints(false);
+    this._stopPanelResize();
 
     // Remove event listeners
     if (this._resizeHandler) {
@@ -565,7 +593,12 @@ export class PlanetaryComputerControl implements IControl {
     const panel = document.createElement('div');
     panel.className = 'pc-control-panel';
     panel.style.width = `${this._options.panelWidth}px`;
-    panel.style.maxHeight = `${this._options.maxHeight}px`;
+    // Height stays `auto` so the panel shrinks to its content. The cap that
+    // stops it from running past the map edge is applied by
+    // `_updatePanelPosition`, which knows the panel's anchor offset.
+    if (this._options.maxHeight > 0) {
+      panel.style.maxHeight = `${this._options.maxHeight}px`;
+    }
 
     // Prevent clicks inside the panel from triggering the click-outside handler
     panel.addEventListener('click', (e) => e.stopPropagation());
@@ -609,8 +642,119 @@ export class PlanetaryComputerControl implements IControl {
     panel.appendChild(header);
     panel.appendChild(nav);
     panel.appendChild(content);
+    panel.appendChild(this._createResizeHandle('sw'));
+    panel.appendChild(this._createResizeHandle('se'));
 
     return panel;
+  }
+
+  /**
+   * Creates a bottom-corner drag handle for resizing the panel.
+   */
+  private _createResizeHandle(corner: ResizeCorner): HTMLElement {
+    const handle = document.createElement('div');
+    handle.className = `pc-resize-handle pc-resize-handle-${corner}`;
+    handle.addEventListener('pointerdown', (e) => this._startPanelResize(e, corner));
+    return handle;
+  }
+
+  /**
+   * Begins a panel resize drag from one of the bottom corners.
+   */
+  private _startPanelResize(event: PointerEvent, corner: ResizeCorner): void {
+    if (event.button !== 0 || !this._panel || !this._mapContainer || this._resizeState) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const panelRect = this._panel.getBoundingClientRect();
+    const mapRect = this._mapContainer.getBoundingClientRect();
+
+    // Anchor the panel to explicit top/left coordinates for the duration of the
+    // drag. Without this, a panel anchored by `bottom`/`right` would grow away
+    // from the handle being dragged.
+    this._panel.style.top = `${panelRect.top - mapRect.top}px`;
+    this._panel.style.left = `${panelRect.left - mapRect.left}px`;
+    this._panel.style.bottom = '';
+    this._panel.style.right = '';
+    this._panel.style.maxWidth = 'none';
+    this._panel.style.maxHeight = 'none';
+    this._panel.style.width = `${panelRect.width}px`;
+    this._panel.style.height = `${panelRect.height}px`;
+    this._panel.classList.add('pc-resizing');
+
+    this._resizeState = {
+      corner,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: panelRect.width,
+      startHeight: panelRect.height,
+      startLeft: panelRect.left - mapRect.left,
+      startTop: panelRect.top - mapRect.top,
+    };
+
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+
+    this._resizePointerMoveHandler = (e) => this._onPanelResizeMove(e);
+    this._resizePointerUpHandler = () => this._stopPanelResize();
+    window.addEventListener('pointermove', this._resizePointerMoveHandler);
+    window.addEventListener('pointerup', this._resizePointerUpHandler);
+    window.addEventListener('pointercancel', this._resizePointerUpHandler);
+  }
+
+  /**
+   * Applies the new panel size as the pointer moves.
+   */
+  private _onPanelResizeMove(event: PointerEvent): void {
+    const state = this._resizeState;
+    if (!state || !this._panel || !this._mapContainer || event.pointerId !== state.pointerId) return;
+
+    const mapRect = this._mapContainer.getBoundingClientRect();
+    const dx = event.clientX - state.startX;
+    const dy = event.clientY - state.startY;
+
+    // The south-east handle extends the right edge; the south-west handle
+    // extends the left edge, so its delta is inverted and `left` shifts too.
+    const maxWidth =
+      state.corner === 'se'
+        ? mapRect.width - state.startLeft - PANEL_EDGE_MARGIN
+        : state.startLeft + state.startWidth - PANEL_EDGE_MARGIN;
+    const rawWidth = state.corner === 'se' ? state.startWidth + dx : state.startWidth - dx;
+    const width = clamp(rawWidth, PANEL_MIN_WIDTH, Math.max(PANEL_MIN_WIDTH, maxWidth));
+
+    const maxHeight = mapRect.height - state.startTop - PANEL_EDGE_MARGIN;
+    const height = clamp(
+      state.startHeight + dy,
+      PANEL_MIN_HEIGHT,
+      Math.max(PANEL_MIN_HEIGHT, maxHeight)
+    );
+
+    this._panel.style.width = `${width}px`;
+    this._panel.style.height = `${height}px`;
+    if (state.corner === 'sw') {
+      this._panel.style.left = `${state.startLeft + (state.startWidth - width)}px`;
+    }
+  }
+
+  /**
+   * Ends a panel resize drag.
+   */
+  private _stopPanelResize(): void {
+    if (!this._resizeState) return;
+
+    this._resizeState = null;
+    this._panel?.classList.remove('pc-resizing');
+
+    if (this._resizePointerMoveHandler) {
+      window.removeEventListener('pointermove', this._resizePointerMoveHandler);
+      this._resizePointerMoveHandler = null;
+    }
+    if (this._resizePointerUpHandler) {
+      window.removeEventListener('pointerup', this._resizePointerUpHandler);
+      window.removeEventListener('pointercancel', this._resizePointerUpHandler);
+      this._resizePointerUpHandler = null;
+    }
   }
 
   /**
@@ -2671,23 +2815,42 @@ export class PlanetaryComputerControl implements IControl {
     this._panel.style.left = '';
     this._panel.style.right = '';
 
+    const anchorOffset = buttonRect.height + panelGap;
+    const isTopAnchored = position === 'top-left' || position === 'top-right';
+    const offsetFromEdge = (isTopAnchored ? buttonTop : buttonBottom) + anchorOffset;
+
     switch (position) {
       case 'top-left':
-        this._panel.style.top = `${buttonTop + buttonRect.height + panelGap}px`;
+        this._panel.style.top = `${buttonTop + anchorOffset}px`;
         this._panel.style.left = `${buttonLeft}px`;
         break;
       case 'top-right':
-        this._panel.style.top = `${buttonTop + buttonRect.height + panelGap}px`;
+        this._panel.style.top = `${buttonTop + anchorOffset}px`;
         this._panel.style.right = `${buttonRight}px`;
         break;
       case 'bottom-left':
-        this._panel.style.bottom = `${buttonBottom + buttonRect.height + panelGap}px`;
+        this._panel.style.bottom = `${buttonBottom + anchorOffset}px`;
         this._panel.style.left = `${buttonLeft}px`;
         break;
       case 'bottom-right':
-        this._panel.style.bottom = `${buttonBottom + buttonRect.height + panelGap}px`;
+        this._panel.style.bottom = `${buttonBottom + anchorOffset}px`;
         this._panel.style.right = `${buttonRight}px`;
         break;
+    }
+
+    // Let the panel grow into whatever vertical space the map leaves between
+    // its anchor and the opposite edge, honoring an explicit `maxHeight` cap.
+    const available = Math.max(
+      PANEL_MIN_HEIGHT,
+      mapRect.height - offsetFromEdge - PANEL_EDGE_MARGIN
+    );
+    const cap = this._options.maxHeight > 0 ? Math.min(this._options.maxHeight, available) : available;
+    this._panel.style.maxHeight = `${cap}px`;
+
+    // A panel the user dragged taller than the new cap must shrink with it.
+    const explicitHeight = parseFloat(this._panel.style.height);
+    if (!Number.isNaN(explicitHeight) && explicitHeight > cap) {
+      this._panel.style.height = `${cap}px`;
     }
   }
 
