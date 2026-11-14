@@ -1,5 +1,134 @@
 import type { Map } from 'maplibre-gl';
 import type { STACCollection, STACItem, STACSearchParams, TileParams } from '../api/types';
+import type { STACClient } from '../api/stac-client';
+import type { TiTilerClient } from '../api/titiler-client';
+
+/**
+ * A host-supplied button rendered inside one of the panel views.
+ *
+ * Custom actions let an embedding application extend the panel (send search
+ * results to another tool, open an item elsewhere, ...) without patching it.
+ */
+export interface PlanetaryComputerCustomAction<TContext> {
+  /** Stable identifier, used as the button's `data-action-id`. */
+  id: string;
+  /** Button text. */
+  label: string;
+  /** Tooltip text. */
+  title?: string;
+  /** Hides the button when it returns false. Defaults to always visible. */
+  isAvailable?: (context: TContext) => boolean;
+  /** Runs when the button is clicked. A rejected promise is shown in the panel as an error. */
+  onClick: (context: TContext) => void | Promise<void>;
+}
+
+/** Context passed to custom actions in the search form. */
+export interface SearchActionContext {
+  /** Collection being searched. */
+  collection: STACCollection;
+  /** Search parameters as the Search button would send them. */
+  searchParams: STACSearchParams;
+  /** Render parameters of the preset selected in the form, if any. */
+  renderParams: TileParams;
+  /** Name of the preset selected in the form, if any. */
+  presetName?: string;
+}
+
+/** Context passed to custom actions in the search results list. */
+export interface ResultsActionContext {
+  /** Collection that was searched. */
+  collection: STACCollection | null;
+  /** Items returned by the search. */
+  items: STACItem[];
+  /** Search parameters that produced the items. */
+  searchParams: STACSearchParams;
+  /** Render parameters of the preset selected in the search form, if any. */
+  renderParams: TileParams;
+  /** Name of the preset selected in the search form, if any. */
+  presetName?: string;
+}
+
+/** Context passed to custom actions in the item detail view. */
+export interface ItemActionContext {
+  /** Item being viewed. */
+  item: STACItem;
+  /** Render parameters currently chosen in the form. */
+  renderParams: TileParams;
+  /** Bounding box drawn in the search form, if any. */
+  bbox: [number, number, number, number] | null;
+}
+
+/** Context passed to custom actions on a row of the Layers view. */
+export interface LayerActionContext {
+  /** Layer the action was invoked on. */
+  layer: ActiveLayer;
+}
+
+/**
+ * Host-supplied buttons, grouped by the panel view they appear in.
+ */
+export interface PlanetaryComputerCustomActions {
+  /** Buttons under the search form. */
+  search?: PlanetaryComputerCustomAction<SearchActionContext>[];
+  /** Buttons in the search results toolbar. */
+  results?: PlanetaryComputerCustomAction<ResultsActionContext>[];
+  /** Buttons in the item detail view. */
+  item?: PlanetaryComputerCustomAction<ItemActionContext>[];
+  /** Buttons on each row of the Layers view. */
+  layer?: PlanetaryComputerCustomAction<LayerActionContext>[];
+}
+
+/**
+ * Placement and identity options shared by the add-layer methods.
+ *
+ * Passing `id` (and optionally `sourceId`) re-creates a previously saved layer
+ * under its original identifiers, which is how a host restores layers from a
+ * saved project.
+ */
+export interface LayerPlacementOptions {
+  /** Layer id to use instead of a generated one. An existing layer with this id is replaced. */
+  id?: string;
+  /** Source id to use instead of `${id}-source`. */
+  sourceId?: string;
+  /** Initial visibility. @default true */
+  visible?: boolean;
+  /** Initial opacity (0-1). @default 1 */
+  opacity?: number;
+  /** Id of an existing map layer to insert this layer before. */
+  beforeId?: string;
+}
+
+/**
+ * Options for adding a single STAC item as a layer.
+ */
+export interface AddItemLayerOptions extends LayerPlacementOptions {
+  /** Asset names to render. */
+  assets?: string[];
+  /** Tile rendering parameters. */
+  renderParams?: TileParams;
+  /** Name of the preset the render parameters came from. */
+  presetName?: string;
+}
+
+/**
+ * Options for adding a mosaic (many items composited into one layer).
+ */
+export interface AddMosaicLayerOptions extends AddItemLayerOptions {
+  /**
+   * Search that selects the items to composite: `datetime` range, `query`
+   * (for example `{ 'eo:cloud_cover': { lte: 10 } }`), `sortby`, `filter`.
+   * `collections` defaults to the collection passed to the method.
+   */
+  searchParams?: Partial<STACSearchParams>;
+  /** Bounds of the layer [west, south, east, north]. Defaults to the collection extent. */
+  bbox?: [number, number, number, number];
+  /**
+   * Search id of a mosaic that is already registered for `searchParams`. When
+   * given, registration is skipped and the layer is added synchronously (the
+   * returned promise is already settled by the time the call returns).
+   */
+  mosaicId?: string;
+}
 
 /**
  * Plugin configuration options.
@@ -77,6 +206,23 @@ export interface PlanetaryComputerOptions {
    * @default true
    */
   autoLoadCollections?: boolean;
+
+  /**
+   * STAC client to use instead of one built from `stacApiUrl`. Supply a
+   * configured or subclassed {@link STACClient} to add a collection fallback,
+   * a custom fetch, or a different search method.
+   */
+  stacClient?: STACClient;
+
+  /**
+   * TiTiler client to use instead of one built from `tilerApiUrl`.
+   */
+  tilerClient?: TiTilerClient;
+
+  /**
+   * Extra buttons supplied by the host application, per panel view.
+   */
+  customActions?: PlanetaryComputerCustomActions;
 }
 
 /**
@@ -95,6 +241,10 @@ export interface ActiveLayer {
   collection?: STACCollection;
   /** Mosaic search ID (for mosaic layers) */
   mosaicId?: string;
+  /** Search that selects the mosaic's items (for mosaic layers) */
+  searchParams?: Partial<STACSearchParams>;
+  /** Layer bounds [west, south, east, north], when known */
+  bounds?: [number, number, number, number];
   /** Layer visibility */
   visible: boolean;
   /** Layer opacity (0-1) */

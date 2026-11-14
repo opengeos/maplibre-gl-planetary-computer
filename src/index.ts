@@ -17,11 +17,21 @@ export type {
   PlanetaryComputerEventData,
   ActiveLayer,
   PanelView,
+  LayerPlacementOptions,
+  AddItemLayerOptions,
+  AddMosaicLayerOptions,
+  PlanetaryComputerCustomAction,
+  PlanetaryComputerCustomActions,
+  SearchActionContext,
+  ResultsActionContext,
+  ItemActionContext,
+  LayerActionContext,
 } from './lib/core/types';
 
 // API client exports
-export { STACClient } from './lib/api/stac-client';
-export { TiTilerClient } from './lib/api/titiler-client';
+export { STACClient, buildStacSearchQuery } from './lib/api/stac-client';
+export type { STACClientOptions } from './lib/api/stac-client';
+export { TiTilerClient, buildMosaicSearchBody } from './lib/api/titiler-client';
 export { SASTokenManager } from './lib/api/sas-token';
 
 // Render presets exports
@@ -47,6 +57,10 @@ export type {
   RenderPreset,
   CollectionRenderConfig,
   SASTokenResponse,
+  TileJSONMetadata,
+  StatisticsParams,
+  BandStatistics,
+  PointValueResponse,
 } from './lib/api/types';
 
 // Utility exports

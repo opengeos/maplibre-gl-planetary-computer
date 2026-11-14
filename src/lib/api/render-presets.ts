@@ -27,6 +27,7 @@ const sentinel2L2aPresets: RenderPreset[] = [
     description: 'Normalized Difference Vegetation Index',
     params: {
       expression: '(B08-B04)/(B08+B04)',
+      asset_as_band: true,
       rescale: '-1,1',
       colormap_name: 'rdylgn',
     },
@@ -37,8 +38,31 @@ const sentinel2L2aPresets: RenderPreset[] = [
     description: 'Normalized Difference Water Index',
     params: {
       expression: '(B03-B08)/(B03+B08)',
+      asset_as_band: true,
       rescale: '-1,1',
       colormap_name: 'blues',
+    },
+  },
+  {
+    name: 'nbr',
+    label: 'NBR',
+    description: 'Normalized Burn Ratio',
+    params: {
+      expression: '(B08-B12)/(B08+B12)',
+      asset_as_band: true,
+      rescale: '-1,1',
+      colormap_name: 'rdylgn',
+    },
+  },
+  {
+    name: 'ndbi',
+    label: 'NDBI',
+    description: 'Normalized Difference Built-up Index',
+    params: {
+      expression: '(B11-B08)/(B11+B08)',
+      asset_as_band: true,
+      rescale: '-1,1',
+      colormap_name: 'rdylbu_r',
     },
   },
   {
@@ -80,6 +104,29 @@ const landsatC2L2Presets: RenderPreset[] = [
     description: 'Normalized Difference Vegetation Index',
     params: {
       expression: '(nir08-red)/(nir08+red)',
+      asset_as_band: true,
+      rescale: '-1,1',
+      colormap_name: 'rdylgn',
+    },
+  },
+  {
+    name: 'ndwi',
+    label: 'NDWI',
+    description: 'Normalized Difference Water Index',
+    params: {
+      expression: '(green-nir08)/(green+nir08)',
+      asset_as_band: true,
+      rescale: '-1,1',
+      colormap_name: 'blues',
+    },
+  },
+  {
+    name: 'nbr',
+    label: 'NBR',
+    description: 'Normalized Burn Ratio',
+    params: {
+      expression: '(nir08-swir22)/(nir08+swir22)',
+      asset_as_band: true,
       rescale: '-1,1',
       colormap_name: 'rdylgn',
     },

@@ -1180,3 +1180,45 @@
   margin-top: 4px;
   display: block;
 }
+
+/* ============ Mosaic, Restyle, and Custom Actions ============ */
+.pc-add-mosaic {
+  width: 100%;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.pc-add-mosaic .pc-search-spinner {
+  border-color: rgba(0, 0, 0, 0.2);
+  border-top-color: #0078d4;
+}
+
+.pc-custom-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pc-notice {
+  white-space: normal;
+}
+
+.pc-layer-controls .pc-layer-style,
+.pc-layer-controls .pc-custom-actions,
+.pc-layer-controls .pc-legend-card {
+  grid-column: 1 / -1;
+}
+
+.pc-layer-style,
+.pc-layer-custom-style {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pc-layer-style .pc-apply-style {
+  align-self: flex-start;
+}

@@ -1,9 +1,27 @@
-import type { Map as MapLibreMap } from 'maplibre-gl';
+import type { Map as MapLibreMap, RasterSourceSpecification } from 'maplibre-gl';
 import type { STACItem, STACCollection, TileParams } from '../api/types';
-import type { ActiveLayer } from './types';
+import type {
+  ActiveLayer,
+  AddItemLayerOptions,
+  AddMosaicLayerOptions,
+  LayerPlacementOptions,
+} from './types';
 import { TiTilerClient } from '../api/titiler-client';
 import { getDefaultPreset } from '../api/render-presets';
 import { generateId } from '../utils/helpers';
+
+/**
+ * Reduces a STAC bbox (2D or 3D) to a 2D [west, south, east, north] tuple.
+ *
+ * @param bbox - STAC bbox with 4 or 6 numbers.
+ * @returns The 2D bounds, or undefined when the bbox is missing or malformed.
+ */
+function toBounds(bbox?: number[]): [number, number, number, number] | undefined {
+  if (!Array.isArray(bbox) || !bbox.every((value) => Number.isFinite(value))) return undefined;
+  if (bbox.length === 4) return [bbox[0], bbox[1], bbox[2], bbox[3]];
+  if (bbox.length === 6) return [bbox[0], bbox[1], bbox[3], bbox[4]];
+  return undefined;
+}
 
 /**
  * Manages raster layers on the MapLibre map.
@@ -29,22 +47,12 @@ export class LayerManager {
    * Adds a STAC item as a raster tile layer.
    *
    * @param item - STAC item to visualize.
-   * @param options - Layer options.
+   * @param options - Layer options. Pass `id` to restore a saved layer under its original id.
    * @returns The created active layer configuration.
    */
-  addItemLayer(
-    item: STACItem,
-    options?: {
-      assets?: string[];
-      renderParams?: TileParams;
-      presetName?: string;
-    }
-  ): ActiveLayer {
-    // Use item ID as layer name, sanitized for use as layer ID
-    const sanitizedItemId = item.id.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 50);
-    const layerId = `${sanitizedItemId}-${generateId().slice(-6)}`;
-    const sourceId = `${layerId}-source`;
+  addItemLayer(item: STACItem, options?: AddItemLayerOptions): ActiveLayer {
     const collectionId = item.collection || '';
+    const { layerId, sourceId } = this.resolveLayerIds(item.id, options);
 
     // Get render params from preset or options
     let renderParams: TileParams = options?.renderParams || {};
@@ -58,69 +66,50 @@ export class LayerManager {
       }
     }
 
-    // Determine assets to use
-    const assets = options?.assets || renderParams.assets || this.getDefaultAssets(item);
-    renderParams = { ...renderParams, assets };
+    // Determine assets to use. An expression names its own assets.
+    const assets =
+      options?.assets ||
+      renderParams.assets ||
+      (renderParams.expression ? [] : this.getDefaultAssets(item));
+    renderParams = assets.length ? { ...renderParams, assets } : { ...renderParams };
 
-    // Generate TileJSON URL
-    const tileJsonUrl = this.tilerClient.getItemTileJSONUrl(collectionId, item.id, renderParams);
-
-    // Add source
-    this.map.addSource(sourceId, {
-      type: 'raster',
-      url: tileJsonUrl,
-      tileSize: renderParams.tile_size || 256,
-      bounds: item.bbox as [number, number, number, number],
-      attribution: 'Microsoft Planetary Computer',
-    });
-
-    // Add layer
-    this.map.addLayer({
-      id: layerId,
-      type: 'raster',
-      source: sourceId,
-      paint: {
-        'raster-opacity': 1,
-      },
-    });
-
+    const bounds = toBounds(item.bbox);
     const layer: ActiveLayer = {
       id: layerId,
       type: 'item',
       sourceId,
       item,
       collection: undefined,
-      visible: true,
-      opacity: 1,
+      visible: options?.visible ?? true,
+      opacity: options?.opacity ?? 1,
       assets,
       renderParams,
       presetName,
+      ...(bounds ? { bounds } : {}),
     };
 
+    this.addMapLayer(layer, options?.beforeId);
     this.layers.set(layerId, layer);
     return layer;
   }
 
   /**
-   * Adds a collection mosaic as a raster tile layer.
+   * Adds a registered mosaic as a raster tile layer.
    *
-   * @param collection - STAC collection.
-   * @param options - Layer options.
+   * The mosaic must already be registered with
+   * {@link TiTilerClient.registerMosaic}; `mosaicId` is the returned search id.
+   *
+   * @param collection - STAC collection the mosaic draws from.
+   * @param mosaicId - Registered search id.
+   * @param options - Layer options. Pass `id` to restore a saved layer under its original id.
    * @returns The created active layer configuration.
    */
-  addCollectionLayer(
+  addMosaicLayer(
     collection: STACCollection,
-    options?: {
-      assets?: string[];
-      renderParams?: TileParams;
-      bbox?: [number, number, number, number];
-      presetName?: string;
-    }
+    mosaicId: string,
+    options?: AddMosaicLayerOptions
   ): ActiveLayer {
-    // Use collection title or ID as layer name
-    const collectionName = (collection.title || collection.id).replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 50);
-    const layerId = `${collectionName}-${generateId().slice(-6)}`;
-    const sourceId = `${layerId}-source`;
+    const { layerId, sourceId } = this.resolveLayerIds(collection.title || collection.id, options);
 
     // Get render params from preset or options
     let renderParams: TileParams = options?.renderParams || {};
@@ -134,50 +123,117 @@ export class LayerManager {
       }
     }
 
-    // Determine assets
+    // Determine assets. An expression names its own assets.
     const assets =
-      options?.assets || renderParams.assets || this.getDefaultCollectionAssets(collection);
-    renderParams = { ...renderParams, assets };
+      options?.assets ||
+      renderParams.assets ||
+      (renderParams.expression ? [] : this.getDefaultCollectionAssets(collection));
+    renderParams = assets.length ? { ...renderParams, assets } : { ...renderParams };
 
-    // Generate tile URL
-    const tileUrl = this.tilerClient.getCollectionTileUrl(collection.id, renderParams);
-
-    // Get bounds
     const bounds = options?.bbox || this.getCollectionBounds(collection);
-
-    // Add source
-    this.map.addSource(sourceId, {
-      type: 'raster',
-      tiles: [tileUrl],
-      tileSize: 256,
-      bounds,
-      attribution: 'Microsoft Planetary Computer',
-    });
-
-    // Add layer
-    this.map.addLayer({
-      id: layerId,
-      type: 'raster',
-      source: sourceId,
-      paint: {
-        'raster-opacity': 1,
-      },
-    });
-
     const layer: ActiveLayer = {
       id: layerId,
-      type: 'collection',
+      type: 'mosaic',
       sourceId,
       collection,
-      visible: true,
-      opacity: 1,
+      mosaicId,
+      searchParams: options?.searchParams,
+      visible: options?.visible ?? true,
+      opacity: options?.opacity ?? 1,
       assets,
       renderParams,
       presetName,
+      ...(bounds ? { bounds } : {}),
     };
 
+    this.addMapLayer(layer, options?.beforeId);
     this.layers.set(layerId, layer);
     return layer;
+  }
+
+  /**
+   * Resolves the layer and source ids for a new layer, removing any map
+   * layer/source that already uses a requested id so a restore is idempotent.
+   *
+   * @param label - Human-readable name the generated id is derived from.
+   * @param options - Placement options that may carry explicit ids.
+   * @returns The layer and source ids to use.
+   */
+  private resolveLayerIds(
+    label: string,
+    options?: LayerPlacementOptions
+  ): { layerId: string; sourceId: string } {
+    const sanitized = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 50);
+    const layerId = options?.id || `${sanitized}-${generateId().slice(-6)}`;
+    const sourceId = options?.sourceId || `${layerId}-source`;
+
+    if (this.layers.has(layerId)) {
+      this.removeLayer(layerId);
+    }
+    if (this.map.getLayer(layerId)) this.map.removeLayer(layerId);
+    if (this.map.getSource(sourceId)) this.map.removeSource(sourceId);
+
+    return { layerId, sourceId };
+  }
+
+  /**
+   * Builds the MapLibre raster source for a layer from its current render state.
+   *
+   * @param layer - Layer configuration.
+   * @returns The raster source specification.
+   */
+  private buildSource(layer: ActiveLayer): RasterSourceSpecification {
+    const params = layer.assets.length
+      ? { ...layer.renderParams, assets: layer.assets }
+      : layer.renderParams;
+    const common = {
+      type: 'raster' as const,
+      tileSize: params.tile_size || 256,
+      ...(layer.bounds ? { bounds: layer.bounds } : {}),
+      attribution: 'Microsoft Planetary Computer',
+    };
+
+    if (layer.type === 'item' && layer.item) {
+      return {
+        ...common,
+        url: this.tilerClient.getItemTileJSONUrl(layer.item.collection || '', layer.item.id, params),
+      };
+    }
+
+    if (layer.type === 'mosaic' && layer.mosaicId) {
+      return {
+        ...common,
+        tiles: [this.tilerClient.getMosaicTileUrl(layer.mosaicId, params, layer.collection?.id)],
+        ...(params.minzoom !== undefined ? { minzoom: params.minzoom } : {}),
+        ...(params.maxzoom !== undefined ? { maxzoom: params.maxzoom } : {}),
+      };
+    }
+
+    throw new Error(`Layer '${layer.id}' has no item or registered mosaic to render`);
+  }
+
+  /**
+   * Adds the MapLibre source and layer for a layer configuration.
+   *
+   * @param layer - Layer configuration.
+   * @param beforeId - Existing map layer to insert before, when it still exists.
+   */
+  private addMapLayer(layer: ActiveLayer, beforeId?: string): void {
+    this.map.addSource(layer.sourceId, this.buildSource(layer));
+    this.map.addLayer(
+      {
+        id: layer.id,
+        type: 'raster',
+        source: layer.sourceId,
+        layout: {
+          visibility: layer.visible ? 'visible' : 'none',
+        },
+        paint: {
+          'raster-opacity': layer.opacity,
+        },
+      },
+      beforeId && this.map.getLayer(beforeId) ? beforeId : undefined
+    );
   }
 
   /**
@@ -205,6 +261,10 @@ export class LayerManager {
   /**
    * Updates layer properties.
    *
+   * Changing `renderParams`, `assets`, or `mosaicId` rebuilds the tile source.
+   * `renderParams` replaces the previous parameters rather than merging, so a
+   * restyle can drop a parameter (for example a colormap).
+   *
    * @param layerId - Layer identifier.
    * @param updates - Properties to update.
    */
@@ -212,23 +272,35 @@ export class LayerManager {
     const layer = this.layers.get(layerId);
     if (!layer) return;
 
-    // Update visibility
-    if (updates.visible !== undefined) {
-      this.map.setLayoutProperty(layerId, 'visibility', updates.visible ? 'visible' : 'none');
+    const next: ActiveLayer = { ...layer, ...updates };
+    const restyled =
+      updates.renderParams !== undefined ||
+      updates.assets !== undefined ||
+      updates.mosaicId !== undefined;
+
+    if (restyled) {
+      if (updates.assets === undefined && updates.renderParams !== undefined) {
+        // An expression names its own assets; otherwise keep the previous ones
+        // unless the new parameters bring their own.
+        next.assets = next.renderParams.expression
+          ? next.renderParams.assets || []
+          : next.renderParams.assets || layer.assets;
+      }
+      next.renderParams = next.assets.length
+        ? { ...next.renderParams, assets: next.assets }
+        : { ...next.renderParams };
+      if (!next.assets.length) delete next.renderParams.assets;
+      this.rebuildLayerSource(next);
+    } else if (this.map.getLayer(layerId)) {
+      if (updates.visible !== undefined) {
+        this.map.setLayoutProperty(layerId, 'visibility', updates.visible ? 'visible' : 'none');
+      }
+      if (updates.opacity !== undefined) {
+        this.map.setPaintProperty(layerId, 'raster-opacity', updates.opacity);
+      }
     }
 
-    // Update opacity
-    if (updates.opacity !== undefined) {
-      this.map.setPaintProperty(layerId, 'raster-opacity', updates.opacity);
-    }
-
-    // Update render params (requires recreating the source)
-    if (updates.renderParams || updates.assets) {
-      this.updateLayerSource(layerId, updates);
-    }
-
-    // Update internal state
-    this.layers.set(layerId, { ...layer, ...updates });
+    this.layers.set(layerId, next);
   }
 
   /**
@@ -268,13 +340,10 @@ export class LayerManager {
     const layer = this.layers.get(layerId);
     if (!layer) return;
 
-    let bounds: [number, number, number, number] | undefined;
-
-    if (layer.item?.bbox) {
-      bounds = layer.item.bbox as [number, number, number, number];
-    } else if (layer.collection) {
-      bounds = this.getCollectionBounds(layer.collection);
-    }
+    const bounds =
+      layer.bounds ||
+      toBounds(layer.item?.bbox) ||
+      (layer.collection ? this.getCollectionBounds(layer.collection) : undefined);
 
     if (bounds) {
       this.map.fitBounds(
@@ -297,67 +366,20 @@ export class LayerManager {
   }
 
   /**
-   * Updates a layer's tile source with new render params.
+   * Rebuilds a layer's tile source after its render state changed, keeping
+   * the layer's position in the map's layer order.
    *
-   * @param layerId - Layer identifier.
-   * @param updates - Updates including new render params.
+   * @param layer - Layer configuration with the new render state already applied.
    */
-  private updateLayerSource(layerId: string, updates: Partial<ActiveLayer>): void {
-    const layer = this.layers.get(layerId);
-    if (!layer) return;
+  private rebuildLayerSource(layer: ActiveLayer): void {
+    const styleLayers = this.map.getStyle()?.layers ?? [];
+    const index = styleLayers.findIndex((styleLayer) => styleLayer.id === layer.id);
+    const beforeId = index >= 0 ? styleLayers[index + 1]?.id : undefined;
 
-    const newParams = { ...layer.renderParams, ...updates.renderParams };
-    const newAssets = updates.assets || layer.assets;
+    if (this.map.getLayer(layer.id)) this.map.removeLayer(layer.id);
+    if (this.map.getSource(layer.sourceId)) this.map.removeSource(layer.sourceId);
 
-    let tileUrl: string;
-
-    if (layer.type === 'item' && layer.item) {
-      const collectionId = layer.item.collection || '';
-      tileUrl = this.tilerClient.getItemTileJSONUrl(collectionId, layer.item.id, {
-        ...newParams,
-        assets: newAssets,
-      });
-    } else if (layer.type === 'collection' && layer.collection) {
-      tileUrl = this.tilerClient.getCollectionTileUrl(layer.collection.id, {
-        ...newParams,
-        assets: newAssets,
-      });
-    } else {
-      return;
-    }
-
-    // Get current layer state
-    const visibility = this.map.getLayoutProperty(layerId, 'visibility');
-    const opacity = this.map.getPaintProperty(layerId, 'raster-opacity');
-
-    // Remove old layer and source
-    this.map.removeLayer(layerId);
-    this.map.removeSource(layer.sourceId);
-
-    // Get bounds
-    const bounds = layer.item?.bbox || (layer.collection ? this.getCollectionBounds(layer.collection) : undefined);
-
-    // Add new source
-    this.map.addSource(layer.sourceId, {
-      type: 'raster',
-      ...(layer.type === 'item' ? { url: tileUrl } : { tiles: [tileUrl] }),
-      tileSize: newParams.tile_size || 256,
-      bounds: bounds as [number, number, number, number] | undefined,
-      attribution: 'Microsoft Planetary Computer',
-    });
-
-    // Add new layer
-    this.map.addLayer({
-      id: layerId,
-      type: 'raster',
-      source: layer.sourceId,
-      layout: {
-        visibility: visibility as 'visible' | 'none' | undefined,
-      },
-      paint: {
-        'raster-opacity': (opacity as number) ?? 1,
-      },
-    });
+    this.addMapLayer(layer, beforeId);
   }
 
   /**
