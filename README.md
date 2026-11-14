@@ -12,6 +12,10 @@ A MapLibre GL JS plugin for searching, visualizing, and downloading data from Mi
 - **Browse 150+ Collections** - Access Sentinel-2, Landsat, NAIP, DEM, and more
 - **Search & Filter** - Search by location (bbox), date range, and collection
 - **Visualize on Map** - Add raster tiles directly to MapLibre with render presets
+- **Mosaics** - Composite every item in a date range (and cloud cover limit) into one seamless layer
+- **Restyle Layers** - Switch preset, colormap, rescale, or band math on a layer already on the map
+- **Inspect & Clip** - Query pixel values of item and mosaic layers, and clip an item to a GeoTIFF
+- **Extensible** - Add your own buttons to the panel and restore layers from a saved project
 - **Download Data** - Get signed URLs to download original data assets
 - **TypeScript Support** - Full type definitions included
 - **React Integration** - Component wrapper and hooks for React apps
@@ -116,6 +120,9 @@ Main control class implementing MapLibre's IControl interface.
 | `tilerApiUrl` | `string` | PC default | TiTiler API base URL |
 | `maxSearchResults` | `number` | `50` | Max items per search |
 | `autoLoadCollections` | `boolean` | `true` | Load collections on init |
+| `stacClient` | `STACClient` | built from `stacApiUrl` | Use your own configured STAC client (custom fetch, collection fallback, search method) |
+| `tilerClient` | `TiTilerClient` | built from `tilerApiUrl` | Use your own TiTiler client |
+| `customActions` | `PlanetaryComputerCustomActions` | none | Extra buttons for the search, results, item, and layer views |
 
 #### Methods
 
@@ -134,10 +141,21 @@ control.selectItem(item)            // Select an item
 
 // Layer management
 control.addItemLayer(item, options)        // Add item as layer
-control.addCollectionLayer(collection)     // Add collection mosaic
+await control.addMosaicLayer(collection, { // Composite many items into one layer
+  searchParams: {
+    datetime: '2024-06-01T00:00:00Z/2024-08-31T23:59:59Z',
+    query: { 'eo:cloud_cover': { lte: 10 } },
+  },
+})
 control.removeLayer(layerId)               // Remove layer
-control.updateLayer(layerId, updates)      // Update layer
+control.updateLayer(layerId, updates)      // Update visibility, opacity, or restyle (renderParams)
 control.zoomToLayer(layerId)               // Zoom to layer
+await control.queryLayerPoint(layerId, lon, lat) // Pixel values of an item or mosaic layer
+control.getItemClipUrl(item, renderParams, bbox) // GeoTIFF clip URL (raw band values)
+
+// API clients used by the control
+control.getStacClient()
+control.getTilerClient()
 
 // Downloads
 await control.getDownloadUrl(item, assetKey) // Get signed URL
@@ -146,6 +164,51 @@ await control.getDownloadUrl(item, assetKey) // Get signed URL
 control.on(event, handler)          // Subscribe to event
 control.off(event, handler)         // Unsubscribe from event
 ```
+
+#### Restoring saved layers
+
+`addItemLayer` and `addMosaicLayer` accept `id`, `sourceId`, `visible`, `opacity`,
+and `beforeId`, so a host application can re-create layers from a saved project
+under their original ids:
+
+```typescript
+const item = await control.getStacClient().getItem('sentinel-2-l2a', saved.itemId);
+control.addItemLayer(item, {
+  id: saved.id,
+  sourceId: saved.sourceId,
+  visible: saved.visible,
+  opacity: saved.opacity,
+  renderParams: saved.renderParams,
+  presetName: saved.presetName,
+});
+```
+
+A mosaic's search id is not permanent. Save the layer's `searchParams` and pass
+them back to `addMosaicLayer`, which registers the search again.
+
+#### Custom actions
+
+Add your own buttons to the panel to hand data to the rest of your application:
+
+```typescript
+const control = new PlanetaryComputerControl({
+  customActions: {
+    results: [
+      {
+        id: 'animate',
+        label: 'Animate',
+        isAvailable: ({ items }) => items.length > 1,
+        onClick: ({ items }) => myApp.animate(items),
+      },
+    ],
+    layer: [{ id: 'chart', label: 'Chart', onClick: ({ layer }) => myApp.chart(layer) }],
+  },
+});
+```
+
+`search` actions receive the collection and the form's search parameters,
+`results` actions the returned items, `item` actions the item with the render
+parameters chosen in the form, and `layer` actions the active layer.
 
 #### Events
 
@@ -201,7 +264,8 @@ You can also use the API clients directly:
 ```typescript
 import { STACClient, TiTilerClient, SASTokenManager } from 'maplibre-gl-planetary-computer';
 
-// STAC API
+// STAC API. Search uses GET by default, which needs no CORS preflight;
+// pass { searchMethod: 'POST' } for very large intersects geometries.
 const stac = new STACClient();
 const collections = await stac.getCollections();
 const items = await stac.search({
@@ -215,6 +279,12 @@ const tileUrl = tiler.getItemTileUrl('sentinel-2-l2a', 'item-id', {
   assets: ['visual'],
 });
 
+// Mosaic of every matching item
+const { tileUrl: mosaicUrl } = await tiler.registerMosaic(
+  { collections: ['sentinel-2-l2a'], datetime: '2024-06-01T00:00:00Z/2024-08-31T23:59:59Z' },
+  { assets: ['visual'] }
+);
+
 // SAS tokens for downloads
 const sas = new SASTokenManager();
 const signedUrl = await sas.signUrl(assetUrl, 'sentinel-2-l2a');
@@ -226,8 +296,8 @@ The plugin includes built-in render presets for common collections:
 
 | Collection | Presets |
 |------------|---------|
-| `sentinel-2-l2a` | True Color, False Color, NDVI, NDWI, SWIR |
-| `landsat-c2-l2` | True Color, False Color, NDVI, Thermal |
+| `sentinel-2-l2a` | True Color, False Color, NDVI, NDWI, NBR, NDBI, SWIR |
+| `landsat-c2-l2` | True Color, False Color, NDVI, NDWI, NBR, Thermal |
 | `naip` | RGB, Color Infrared, NDVI |
 | `cop-dem-glo-30/90` | Elevation, Hillshade |
 

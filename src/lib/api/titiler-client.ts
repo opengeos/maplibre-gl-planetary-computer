@@ -8,6 +8,93 @@ import type {
 
 const DEFAULT_TILER_URL = 'https://planetarycomputer.microsoft.com/api/data/v1';
 
+const QUERY_OPERATORS: Record<string, string> = {
+  eq: '=',
+  neq: '<>',
+  lt: '<',
+  lte: '<=',
+  gt: '>',
+  gte: '>=',
+};
+
+/**
+ * Splits a STAC `datetime` value into a closed CQL2 interval.
+ *
+ * @param datetime - Single datetime or `start/end` range (`..` for open ends).
+ * @returns The `[start, end]` interval.
+ */
+function datetimeInterval(datetime: string): [string, string] {
+  const [start, end] = datetime.includes('/') ? datetime.split('/') : [datetime, datetime];
+  return [start && start !== '..' ? start : '..', end && end !== '..' ? end : '..'];
+}
+
+/**
+ * Builds the body for a Data API `POST /mosaic/register` request.
+ *
+ * The mosaic endpoint takes a CQL2 search, so the simple STAC search fields
+ * (`datetime`, the `query` extension, `bbox`, `intersects`) are translated into one CQL2
+ * JSON `filter`. An explicit `filter` in the parameters is combined with them.
+ *
+ * @param searchParams - STAC search parameters describing the mosaic.
+ * @returns The JSON-serializable request body.
+ */
+export function buildMosaicSearchBody(searchParams: Partial<STACSearchParams>): Record<string, unknown> {
+  const args: unknown[] = [];
+
+  // Several collections are alternatives: an item belongs to exactly one.
+  const collections = searchParams.collections ?? [];
+  if (collections.length === 1) {
+    args.push({ op: '=', args: [{ property: 'collection' }, collections[0]] });
+  } else if (collections.length > 1) {
+    args.push({ op: 'in', args: [{ property: 'collection' }, collections] });
+  }
+  if (searchParams.datetime) {
+    args.push({
+      op: 'anyinteracts',
+      args: [{ property: 'datetime' }, { interval: datetimeInterval(searchParams.datetime) }],
+    });
+  }
+  if (searchParams.bbox) {
+    const [west, south, east, north] = searchParams.bbox;
+    args.push({
+      op: 's_intersects',
+      args: [
+        { property: 'geometry' },
+        {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [west, south],
+              [east, south],
+              [east, north],
+              [west, north],
+              [west, south],
+            ],
+          ],
+        },
+      ],
+    });
+  }
+  if (searchParams.intersects) {
+    args.push({ op: 's_intersects', args: [{ property: 'geometry' }, searchParams.intersects] });
+  }
+  for (const [property, conditions] of Object.entries(searchParams.query ?? {})) {
+    if (!conditions || typeof conditions !== 'object') continue;
+    for (const [operator, value] of Object.entries(conditions as Record<string, unknown>)) {
+      const op = QUERY_OPERATORS[operator];
+      if (op) args.push({ op, args: [{ property }, value] });
+    }
+  }
+  if (searchParams.filter) args.push(searchParams.filter);
+
+  const body: Record<string, unknown> = { 'filter-lang': 'cql2-json' };
+  if (searchParams.collections?.length) body.collections = searchParams.collections;
+  if (args.length === 1) body.filter = args[0];
+  else if (args.length > 1) body.filter = { op: 'and', args };
+  if (searchParams.sortby?.length) body.sortby = searchParams.sortby;
+  return body;
+}
+
 /**
  * Client for interacting with the Planetary Computer TiTiler API.
  * Provides methods for generating tile URLs for visualization.
@@ -41,6 +128,10 @@ export class TiTilerClient {
 
   /**
    * Generates a tile URL for a collection mosaic.
+   *
+   * @deprecated The Planetary Computer Data API only serves mosaic tiles for a
+   * registered search. Use {@link TiTilerClient.registerMosaic} and
+   * {@link TiTilerClient.getMosaicTileUrl} instead.
    *
    * @param collectionId - Collection identifier.
    * @param params - Tile rendering parameters.
@@ -138,39 +229,86 @@ export class TiTilerClient {
   }
 
   /**
-   * Registers a custom search mosaic and returns the tile URL.
+   * Registers a search as a mosaic and returns its tile URL.
+   *
+   * The search is the set of items the mosaic draws from (collections, date
+   * range, cloud cover, ...). Registration is idempotent, and search ids are
+   * not guaranteed to live forever, so re-register when restoring a saved layer.
    *
    * @param searchParams - STAC search parameters for the mosaic.
    * @param tileParams - Tile rendering parameters.
    * @returns Promise resolving to mosaic info including tile URL and search ID.
    */
   async registerMosaic(
-    searchParams: STACSearchParams,
+    searchParams: Partial<STACSearchParams>,
     tileParams: TileParams = {}
   ): Promise<{ searchId: string; tileUrl: string }> {
     const response = await fetch(`${this.baseUrl}/mosaic/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        collections: searchParams.collections,
-        filter: searchParams.filter,
-        'filter-lang': searchParams['filter-lang'] || 'cql2-json',
-        sortby: searchParams.sortby,
-      }),
+      body: JSON.stringify(buildMosaicSearchBody(searchParams)),
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to register mosaic: ${response.statusText}`);
+      throw new Error(await this.getErrorMessage(response, 'Failed to register mosaic'));
     }
 
     const data = await response.json();
-    const searchId = data.id || data.searchid;
-    const queryString = this.buildQueryString(tileParams);
+    const searchId = data.searchid || data.id;
+    if (!searchId) throw new Error('Failed to register mosaic: no search id returned');
 
     return {
       searchId,
-      tileUrl: `${this.baseUrl}/mosaic/tiles/WebMercatorQuad/{z}/{x}/{y}@1x?searchid=${searchId}${queryString ? '&' + queryString : ''}`,
+      tileUrl: this.getMosaicTileUrl(searchId, tileParams, searchParams.collections?.[0]),
     };
+  }
+
+  /**
+   * Generates a tile URL template for a registered mosaic.
+   *
+   * @param searchId - Search id returned by {@link TiTilerClient.registerMosaic}.
+   * @param params - Tile rendering parameters.
+   * @param collectionId - Collection the mosaic draws from (lets the API apply collection defaults).
+   * @returns Tile URL template with {z}/{x}/{y} placeholders.
+   */
+  getMosaicTileUrl(searchId: string, params: TileParams = {}, collectionId?: string): string {
+    const query = [
+      collectionId ? `collection=${encodeURIComponent(collectionId)}` : '',
+      this.buildQueryString(params),
+    ]
+      .filter(Boolean)
+      .join('&');
+    const scale = params.tile_scale || 1;
+    const format = params.tile_format ? `.${params.tile_format}` : '';
+    return `${this.baseUrl}/mosaic/${encodeURIComponent(searchId)}/tiles/WebMercatorQuad/{z}/{x}/{y}@${scale}x${format}${query ? '?' + query : ''}`;
+  }
+
+  /**
+   * Lists the items a registered mosaic draws from at a coordinate, topmost first.
+   *
+   * @param searchId - Search id returned by {@link TiTilerClient.registerMosaic}.
+   * @param lon - Longitude.
+   * @param lat - Latitude.
+   * @param collectionId - Collection the mosaic draws from.
+   * @returns Promise resolving to the contributing items (id, bbox, assets, collection).
+   */
+  async getMosaicItemsAtPoint(
+    searchId: string,
+    lon: number,
+    lat: number,
+    collectionId?: string
+  ): Promise<Array<{ id: string; collection?: string; bbox?: number[]; [key: string]: unknown }>> {
+    const query = collectionId ? `?collection=${encodeURIComponent(collectionId)}` : '';
+    const response = await fetch(
+      `${this.baseUrl}/mosaic/${encodeURIComponent(searchId)}/${lon},${lat}/assets${query}`
+    );
+
+    if (!response.ok) {
+      throw new Error(await this.getErrorMessage(response, 'Failed to get mosaic items'));
+    }
+
+    const data = await response.json();
+    return Array.isArray(data) ? data : [];
   }
 
   /**
@@ -317,6 +455,36 @@ export class TiTilerClient {
   ): string {
     const queryString = this.buildQueryString(params);
     return `${this.baseUrl}/item/bbox/${bbox.join(',')}/${size.width}x${size.height}.${format}?collection=${encodeURIComponent(collectionId)}&item=${encodeURIComponent(itemId)}${queryString ? '&' + queryString : ''}`;
+  }
+
+  /**
+   * Gets a URL that clips a STAC item to a bounding box at (up to) native resolution.
+   *
+   * Unlike {@link TiTilerClient.getItemBboxImageUrl} the output size follows
+   * the data, capped by `maxSize`. With the default `tif` format and no
+   * `rescale`/`colormap_name` the result is a GeoTIFF holding the raw band
+   * values, suitable for analysis.
+   *
+   * @param collectionId - Collection identifier.
+   * @param itemId - Item identifier.
+   * @param bbox - Bounding box [west, south, east, north] in WGS84.
+   * @param params - Rendering parameters (assets, expression, ...).
+   * @param options - Output format and maximum dimension in pixels.
+   * @returns Clip URL.
+   */
+  getItemCropUrl(
+    collectionId: string,
+    itemId: string,
+    bbox: [number, number, number, number],
+    params: TileParams = {},
+    options: { format?: 'tif' | 'png' | 'jpg' | 'jpeg' | 'webp' | 'npy'; maxSize?: number } = {}
+  ): string {
+    const format = options.format ?? 'tif';
+    const queryString = this.buildQueryString({
+      ...params,
+      max_size: options.maxSize ?? 2048,
+    } as StatisticsParams);
+    return `${this.baseUrl}/item/bbox/${bbox.join(',')}.${format}?collection=${encodeURIComponent(collectionId)}&item=${encodeURIComponent(itemId)}${queryString ? '&' + queryString : ''}`;
   }
 
   /**

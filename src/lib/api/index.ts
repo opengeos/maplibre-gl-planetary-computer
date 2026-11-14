@@ -1,6 +1,7 @@
 // API clients
-export { STACClient } from './stac-client';
-export { TiTilerClient } from './titiler-client';
+export { STACClient, buildStacSearchQuery } from './stac-client';
+export type { STACClientOptions } from './stac-client';
+export { TiTilerClient, buildMosaicSearchBody } from './titiler-client';
 export { SASTokenManager } from './sas-token';
 
 // Render presets

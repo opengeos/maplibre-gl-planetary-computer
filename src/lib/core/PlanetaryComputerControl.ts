@@ -13,6 +13,9 @@ import type {
   PlanetaryComputerEventHandler,
   ActiveLayer,
   PanelView,
+  AddItemLayerOptions,
+  AddMosaicLayerOptions,
+  PlanetaryComputerCustomAction,
 } from './types';
 import type {
   BandStatistics,
@@ -34,12 +37,17 @@ import {
   clamp,
   toMinimalStacJson,
 } from '../utils/helpers';
-import { getPresetsForCollection } from '../api/render-presets';
+import { getPreset, getPresetsForCollection } from '../api/render-presets';
 
 /**
  * Default options for the control.
  */
-const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
+type ResolvedOptions = Required<
+  Omit<PlanetaryComputerOptions, 'stacClient' | 'tilerClient' | 'customActions'>
+> &
+  Pick<PlanetaryComputerOptions, 'stacClient' | 'tilerClient' | 'customActions'>;
+
+const DEFAULT_OPTIONS: ResolvedOptions = {
   collapsed: true,
   position: 'top-right',
   title: 'Planetary Computer',
@@ -53,6 +61,60 @@ const DEFAULT_OPTIONS: Required<PlanetaryComputerOptions> = {
   maxSearchResults: 50,
   autoLoadCollections: true,
 };
+
+/** Named colormaps offered in the style forms (all served by the Data API). */
+const COLORMAPS: Array<{ name: string; label: string }> = [
+  { name: '', label: 'None (Default)' },
+  { name: 'viridis', label: 'Viridis' },
+  { name: 'plasma', label: 'Plasma' },
+  { name: 'inferno', label: 'Inferno' },
+  { name: 'magma', label: 'Magma' },
+  { name: 'cividis', label: 'Cividis' },
+  { name: 'terrain', label: 'Terrain' },
+  { name: 'rdylgn', label: 'Red-Yellow-Green' },
+  { name: 'rdylbu', label: 'Red-Yellow-Blue' },
+  { name: 'rdylbu_r', label: 'Blue-Yellow-Red' },
+  { name: 'spectral', label: 'Spectral' },
+  { name: 'coolwarm', label: 'Cool-Warm' },
+  { name: 'blues', label: 'Blues' },
+  { name: 'greens', label: 'Greens' },
+  { name: 'reds', label: 'Reds' },
+  { name: 'greys', label: 'Greys' },
+  { name: 'gray', label: 'Gray' },
+  { name: 'ylgnbu', label: 'Yellow-Green-Blue' },
+  { name: 'rainbow', label: 'Rainbow' },
+];
+
+/** Values of the search form, kept across re-renders of the search view. */
+interface SearchFormState {
+  startDate: string;
+  endDate: string;
+  cloudCover: number;
+  limit: number;
+  sortBy: string;
+  presetName: string;
+}
+
+const DEFAULT_SEARCH_FORM: SearchFormState = {
+  startDate: '',
+  endDate: '',
+  cloudCover: 100,
+  limit: 50,
+  sortBy: 'datetime-desc',
+  presetName: '',
+};
+
+/**
+ * Tells whether a band-math expression refers to whole assets (`B08`) rather
+ * than to bands of an asset (`image_b4`). Asset-level expressions need the
+ * Data API's `asset_as_band` flag.
+ *
+ * @param expression - Band-math expression.
+ * @returns True when the expression has no `<asset>_b<N>` band reference.
+ */
+function expressionUsesAssetsAsBands(expression: string): boolean {
+  return !/_b\d+\b/.test(expression);
+}
 
 const FOOTPRINT_SOURCE_ID = 'pc-search-footprints';
 const FOOTPRINT_FILL_LAYER_ID = 'pc-search-footprints-fill';
@@ -127,7 +189,10 @@ export class PlanetaryComputerControl implements IControl {
   private _container?: HTMLElement;
   private _panel?: HTMLElement;
   private _contentEl?: HTMLElement;
-  private _options: Required<PlanetaryComputerOptions>;
+  private _options: ResolvedOptions;
+  private _searchForm: SearchFormState = { ...DEFAULT_SEARCH_FORM };
+  private _mosaicLoading = false;
+  private _notice: { kind: 'error' | 'success'; message: string } | null = null;
   private _state: PlanetaryComputerState;
   private _eventHandlers: EventHandlersMap = new globalThis.Map();
 
@@ -171,8 +236,8 @@ export class PlanetaryComputerControl implements IControl {
     this._state = this._getInitialState();
 
     // Initialize API clients
-    this._stacClient = new STACClient(this._options.stacApiUrl);
-    this._tilerClient = new TiTilerClient(this._options.tilerApiUrl);
+    this._stacClient = this._options.stacClient ?? new STACClient(this._options.stacApiUrl);
+    this._tilerClient = this._options.tilerClient ?? new TiTilerClient(this._options.tilerApiUrl);
     this._sasManager = new SASTokenManager();
   }
 
@@ -235,6 +300,8 @@ export class PlanetaryComputerControl implements IControl {
 
     // Remove layers from map
     this._layerManager?.removeAllLayers();
+    this._layerManager = undefined;
+    this._state.activeLayers = [];
 
     // Remove DOM elements
     this._panel?.parentNode?.removeChild(this._panel);
@@ -302,8 +369,8 @@ export class PlanetaryComputerControl implements IControl {
     const searchParams: STACSearchParams = {
       ...this._state.searchParams,
       ...params,
-      limit: this._options.maxSearchResults,
     };
+    searchParams.limit ??= this._options.maxSearchResults;
 
     this._state.searchParams = searchParams;
     this._state.searchLoading = true;
@@ -335,52 +402,229 @@ export class PlanetaryComputerControl implements IControl {
   }
 
   /**
+   * Gets the STAC client the control searches with.
+   *
+   * @returns The STAC client.
+   */
+  getStacClient(): STACClient {
+    return this._stacClient;
+  }
+
+  /**
+   * Gets the TiTiler (Data API) client the control renders with.
+   *
+   * @returns The TiTiler client.
+   */
+  getTilerClient(): TiTilerClient {
+    return this._tilerClient;
+  }
+
+  /**
    * Adds a STAC item as a raster layer on the map.
+   *
+   * Pass `options.id` to re-create a saved layer under its original id (an
+   * existing layer with that id is replaced), which is how a host application
+   * restores layers from a saved project.
    *
    * @param item - STAC item to visualize.
    * @param options - Layer options.
    * @returns The created active layer.
    */
-  addItemLayer(
-    item: STACItem,
-    options?: { assets?: string[]; renderParams?: TileParams; presetName?: string }
-  ): ActiveLayer {
+  addItemLayer(item: STACItem, options?: AddItemLayerOptions): ActiveLayer {
     if (!this._layerManager) throw new Error('Control not added to map');
 
     const layer = this._layerManager.addItemLayer(item, options);
     layer.showControls = false;
-    this._state.activeLayers.push(layer);
-    this._emit('layer:add');
-    this._emit('statechange');
-    this._renderContent();
+    this._trackLayer(layer);
     return layer;
   }
 
   /**
-   * Adds a collection mosaic as a raster layer.
+   * Adds a mosaic layer: every item of a collection that matches a search
+   * (date range, cloud cover, ...) composited into one layer.
+   *
+   * The search is registered with the Data API first, so this is asynchronous.
+   * Pass `options.id` to re-create a saved layer under its original id.
+   *
+   * @param collection - STAC collection to composite.
+   * @param options - Layer options, including the `searchParams` that select the items.
+   * @returns Promise resolving to the created active layer.
+   */
+  async addMosaicLayer(
+    collection: STACCollection,
+    options?: AddMosaicLayerOptions
+  ): Promise<ActiveLayer> {
+    if (!this._layerManager) throw new Error('Control not added to map');
+
+    const searchParams: Partial<STACSearchParams> = {
+      ...options?.searchParams,
+      collections: [collection.id],
+    };
+    // Paging and spatial fields do not belong in a mosaic search: tiles are
+    // requested per map tile, and `bbox` only bounds the layer.
+    delete searchParams.limit;
+    delete searchParams.bbox;
+    delete searchParams.ids;
+
+    // Registration is asynchronous; the control may be removed (or re-added to
+    // another map) before it completes, and must not gain a layer then.
+    const layerManager = this._layerManager;
+    let searchId = options?.mosaicId;
+    if (!searchId) {
+      ({ searchId } = await this._tilerClient.registerMosaic(searchParams));
+      if (this._layerManager !== layerManager || !this._map) {
+        throw new Error('Control was removed from the map');
+      }
+    }
+
+    const layer = layerManager.addMosaicLayer(collection, searchId, {
+      ...options,
+      searchParams,
+    });
+    layer.showControls = false;
+    this._trackLayer(layer);
+    return layer;
+  }
+
+  /**
+   * Adds a whole collection as a mosaic layer.
+   *
+   * @deprecated Use {@link PlanetaryComputerControl.addMosaicLayer}. The Data
+   * API serves mosaics only for a registered search, so this is asynchronous.
    *
    * @param collection - STAC collection.
    * @param options - Layer options.
-   * @returns The created active layer.
+   * @returns Promise resolving to the created active layer.
    */
   addCollectionLayer(
     collection: STACCollection,
-    options?: {
-      assets?: string[];
-      renderParams?: TileParams;
-      bbox?: [number, number, number, number];
-      presetName?: string;
-    }
-  ): ActiveLayer {
-    if (!this._layerManager) throw new Error('Control not added to map');
+    options?: AddMosaicLayerOptions
+  ): Promise<ActiveLayer> {
+    return this.addMosaicLayer(collection, options);
+  }
 
-    const layer = this._layerManager.addCollectionLayer(collection, options);
-    layer.showControls = false;
-    this._state.activeLayers.push(layer);
-    this._emit('layer:add');
+  /**
+   * Records a newly added layer in the control state and announces it.
+   *
+   * @param layer - Layer returned by the layer manager.
+   */
+  private _trackLayer(layer: ActiveLayer): void {
+    this._state.activeLayers = [
+      ...this._state.activeLayers.filter((current) => current.id !== layer.id),
+      layer,
+    ];
+    this._emit('layer:add', layer);
     this._emit('statechange');
     this._renderContent();
-    return layer;
+  }
+
+  /**
+   * Queries pixel values of a layer at a coordinate.
+   *
+   * Item layers are read directly. For a mosaic, the topmost item at the
+   * coordinate is located first and then read.
+   *
+   * @param layerId - Layer identifier.
+   * @param lon - Longitude.
+   * @param lat - Latitude.
+   * @returns Promise resolving to the point values plus the id of the item they came from.
+   */
+  async queryLayerPoint(
+    layerId: string,
+    lon: number,
+    lat: number
+  ): Promise<PointValueResponse & { itemId?: string }> {
+    const layer = this._layerManager?.getLayer(layerId);
+    if (!layer) throw new Error(`Layer '${layerId}' not found`);
+
+    const params = layer.assets.length
+      ? { ...layer.renderParams, assets: layer.assets }
+      : layer.renderParams;
+
+    if (layer.type === 'item' && layer.item?.collection) {
+      const data = await this._tilerClient.getItemPoint(
+        layer.item.collection,
+        layer.item.id,
+        lon,
+        lat,
+        params
+      );
+      return { ...data, itemId: layer.item.id };
+    }
+
+    if (layer.type === 'mosaic' && layer.mosaicId && layer.collection) {
+      const items = await this._tilerClient.getMosaicItemsAtPoint(
+        layer.mosaicId,
+        lon,
+        lat,
+        layer.collection.id
+      );
+      const top = items[0];
+      if (!top) throw new Error('No data at this location');
+      const data = await this._tilerClient.getItemPoint(
+        top.collection || layer.collection.id,
+        top.id,
+        lon,
+        lat,
+        params
+      );
+      return { ...data, itemId: top.id };
+    }
+
+    throw new Error(`Layer '${layerId}' cannot be queried`);
+  }
+
+  /**
+   * Gets a URL that clips an item to a bounding box as a GeoTIFF of raw band values.
+   *
+   * Display-only parameters (rescale, colormap, color formula) are dropped so
+   * the file holds data values rather than a rendered picture.
+   *
+   * @param item - STAC item.
+   * @param renderParams - Parameters selecting the bands (assets, expression, ...).
+   * @param bbox - Clip bounds; defaults to the drawn bbox, else the map view. It is clamped to the item footprint.
+   * @param maxSize - Maximum output dimension in pixels.
+   * @returns The clip URL, or null when the bounds do not overlap the item.
+   */
+  getItemClipUrl(
+    item: STACItem,
+    renderParams: TileParams = {},
+    bbox?: [number, number, number, number],
+    maxSize: number = 2048
+  ): string | null {
+    if (!item.collection) return null;
+
+    let bounds = bbox || this._state.drawnBbox;
+    if (!bounds && this._map) {
+      const view = this._map.getBounds();
+      bounds = [view.getWest(), view.getSouth(), view.getEast(), view.getNorth()];
+    }
+    if (!bounds) return null;
+
+    if (item.bbox?.length === 4) {
+      bounds = [
+        Math.max(bounds[0], item.bbox[0]),
+        Math.max(bounds[1], item.bbox[1]),
+        Math.min(bounds[2], item.bbox[2]),
+        Math.min(bounds[3], item.bbox[3]),
+      ];
+    }
+    if (!(bounds[0] < bounds[2] && bounds[1] < bounds[3])) return null;
+
+    const dataParams: TileParams = { ...renderParams };
+    delete dataParams.rescale;
+    delete dataParams.colormap_name;
+    delete dataParams.colormap;
+    delete dataParams.color_formula;
+    delete dataParams.tile_format;
+    delete dataParams.tile_scale;
+    delete dataParams.minzoom;
+    delete dataParams.maxzoom;
+
+    return this._tilerClient.getItemCropUrl(item.collection, item.id, bounds, dataParams, {
+      format: 'tif',
+      maxSize,
+    });
   }
 
   /**
@@ -409,12 +653,14 @@ export class PlanetaryComputerControl implements IControl {
     this._layerManager?.updateLayer(layerId, updates);
     const layerIndex = this._state.activeLayers.findIndex((l) => l.id === layerId);
     if (layerIndex >= 0) {
-      this._state.activeLayers[layerIndex] = {
+      // The layer manager normalizes a restyle (assets vs. expression), so
+      // mirror its copy instead of merging the raw updates.
+      this._state.activeLayers[layerIndex] = this._layerManager?.getLayer(layerId) ?? {
         ...this._state.activeLayers[layerIndex],
         ...updates,
       };
     }
-    this._emit('layer:update');
+    this._emit('layer:update', this._state.activeLayers[layerIndex]);
     this._emit('statechange');
   }
 
@@ -451,6 +697,8 @@ export class PlanetaryComputerControl implements IControl {
     this._stopBboxDraw(false);
     this._clearSearchFootprints(false);
     this._state.selectedCollection = collection;
+    this._searchForm = { ...DEFAULT_SEARCH_FORM };
+    this._notice = null;
     this._state.searchParams = collection ? { collections: [collection.id] } : {};
     this._state.activeView = collection ? 'search' : 'collections';
     this._state.searchResults = [];
@@ -467,6 +715,7 @@ export class PlanetaryComputerControl implements IControl {
    * @param item - Item to select.
    */
   selectItem(item: STACItem | null): void {
+    this._notice = null;
     this._state.selectedItem = item;
     this._state.selectedSearchResultId = item?.id || null;
     this._updateSelectedFootprint();
@@ -515,6 +764,7 @@ export class PlanetaryComputerControl implements IControl {
    * @param view - View to display.
    */
   setView(view: PanelView): void {
+    this._notice = null;
     this._state.activeView = view;
     this._emit('statechange');
     this._renderContent();
@@ -934,12 +1184,14 @@ export class PlanetaryComputerControl implements IControl {
 
     const collection = this._state.selectedCollection;
     const presets = getPresetsForCollection(collection.id);
+    const form = this._searchForm;
+    const selectedPreset = form.presetName || presets[0]?.name || '';
 
     // Check if collection supports cloud cover filtering
     const supportsCloudCover = this._collectionSupportsCloudCover(collection);
 
     this._contentEl.innerHTML = `
-      <div class="pc-search-panel">
+      <div class="pc-search-panel" data-collection-id="${this._escapeHtml(collection.id)}">
         <button type="button" class="pc-btn-back">&larr; Back to collections</button>
 
         <div class="pc-selected-collection">
@@ -979,9 +1231,9 @@ export class PlanetaryComputerControl implements IControl {
         <div class="pc-form-group">
           <label class="pc-label">Date Range</label>
           <div class="pc-date-inputs">
-            <input type="date" class="pc-input pc-date-start">
+            <input type="date" class="pc-input pc-date-start" value="${this._escapeHtml(form.startDate)}">
             <span class="pc-date-separator">to</span>
-            <input type="date" class="pc-input pc-date-end">
+            <input type="date" class="pc-input pc-date-end" value="${this._escapeHtml(form.endDate)}">
           </div>
         </div>
 
@@ -989,8 +1241,8 @@ export class PlanetaryComputerControl implements IControl {
         <div class="pc-form-group">
           <label class="pc-label">Max Cloud Cover (%)</label>
           <div class="pc-cloud-cover-input">
-            <input type="range" class="pc-cloud-slider" min="0" max="100" value="100">
-            <span class="pc-cloud-value">100%</span>
+            <input type="range" class="pc-cloud-slider" min="0" max="100" value="${form.cloudCover}">
+            <span class="pc-cloud-value">${form.cloudCover}%</span>
           </div>
         </div>
         ` : ''}
@@ -998,22 +1250,30 @@ export class PlanetaryComputerControl implements IControl {
         <div class="pc-form-group">
           <label class="pc-label">Results Limit</label>
           <select class="pc-input pc-limit-select">
-            <option value="10">10</option>
-            <option value="25">25</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
+            ${[10, 25, 50, 100]
+              .map((n) => `<option value="${n}"${form.limit === n ? ' selected' : ''}>${n}</option>`)
+              .join('')}
           </select>
         </div>
 
         <div class="pc-form-group">
           <label class="pc-label">Sort By</label>
           <select class="pc-input pc-sort-select">
-            <option value="datetime-desc">Date (Newest First)</option>
-            <option value="datetime-asc">Date (Oldest First)</option>
-            ${supportsCloudCover ? `
-            <option value="cloud-asc">Cloud Cover (Lowest First)</option>
-            <option value="cloud-desc">Cloud Cover (Highest First)</option>
-            ` : ''}
+            ${[
+              ['datetime-desc', 'Date (Newest First)'],
+              ['datetime-asc', 'Date (Oldest First)'],
+              ...(supportsCloudCover
+                ? [
+                    ['cloud-asc', 'Cloud Cover (Lowest First)'],
+                    ['cloud-desc', 'Cloud Cover (Highest First)'],
+                  ]
+                : []),
+            ]
+              .map(
+                ([value, label]) =>
+                  `<option value="${value}"${form.sortBy === value ? ' selected' : ''}>${label}</option>`
+              )
+              .join('')}
           </select>
         </div>
 
@@ -1023,7 +1283,12 @@ export class PlanetaryComputerControl implements IControl {
           <div class="pc-form-group">
             <label class="pc-label">Visualization Preset</label>
             <select class="pc-input pc-preset-select">
-              ${presets.map((p) => `<option value="${p.name}">${p.label}</option>`).join('')}
+              ${presets
+                .map(
+                  (p) =>
+                    `<option value="${p.name}"${selectedPreset === p.name ? ' selected' : ''}>${p.label}</option>`
+                )
+                .join('')}
             </select>
           </div>
         `
@@ -1035,8 +1300,28 @@ export class PlanetaryComputerControl implements IControl {
         }" ${this._state.searchLoading ? 'disabled aria-busy="true"' : ''}>
           ${this._state.searchLoading ? '<span class="pc-search-spinner"></span>Searching...' : 'Search Items'}
         </button>
+        <button type="button" class="pc-btn pc-add-mosaic" title="Composite every item matching the date range and cloud cover into one seamless layer" ${
+          this._mosaicLoading ? 'disabled aria-busy="true"' : ''
+        }>
+          ${this._mosaicLoading ? '<span class="pc-search-spinner"></span>Adding mosaic...' : 'Add Mosaic'}
+        </button>
+        ${this._renderCustomActions(this._options.customActions?.search, () => this._searchActionContext(collection))}
+        ${this._renderNotice()}
       </div>
     `;
+
+    const persistForm = () => this._readSearchForm();
+    this._contentEl
+      .querySelectorAll('.pc-date-start, .pc-date-end, .pc-cloud-slider, .pc-limit-select, .pc-sort-select, .pc-preset-select')
+      .forEach((el) => el.addEventListener('change', persistForm));
+
+    this._contentEl.querySelector('.pc-add-mosaic')?.addEventListener('click', () => {
+      void this._addMosaicFromForm(collection);
+    });
+
+    this._bindCustomActions(this._options.customActions?.search, () =>
+      this._searchActionContext(collection)
+    );
 
     // Event handlers
     this._contentEl.querySelector('.pc-btn-back')?.addEventListener('click', () => {
@@ -1090,48 +1375,236 @@ export class PlanetaryComputerControl implements IControl {
     this._contentEl.querySelector('.pc-search-btn')?.addEventListener('click', () => {
       if (this._state.searchLoading) return;
 
-      const startDate = (this._contentEl?.querySelector('.pc-date-start') as HTMLInputElement)?.value;
-      const endDate = (this._contentEl?.querySelector('.pc-date-end') as HTMLInputElement)?.value;
-      const cloudCover = (this._contentEl?.querySelector('.pc-cloud-slider') as HTMLInputElement)?.value;
-      const limit = (this._contentEl?.querySelector('.pc-limit-select') as HTMLSelectElement)?.value;
-      const sortBy = (this._contentEl?.querySelector('.pc-sort-select') as HTMLSelectElement)?.value;
+      this._notice = null;
+      this._state.searchParams = this._buildSearchParams(true);
+      this.search().catch(() => {
+        // The failure is already shown in the panel through the error state.
+      });
+    });
+  }
 
-      if (startDate || endDate) {
-        const start = startDate ? `${startDate}T00:00:00Z` : '..';
-        const end = endDate ? `${endDate}T23:59:59Z` : '..';
-        this._state.searchParams.datetime = `${start}/${end}`;
+  /**
+   * Reads the search form inputs into the persisted form state.
+   *
+   * @returns The current form state.
+   */
+  private _readSearchForm(): SearchFormState {
+    const root = this._contentEl;
+    // Only the mounted form of the collection being searched is authoritative.
+    // While the view is being re-rendered for another collection the DOM still
+    // holds the previous collection's inputs, which must not leak into its form.
+    const panel = root?.querySelector<HTMLElement>('.pc-search-panel');
+    if (!root || !panel || panel.dataset.collectionId !== this._state.selectedCollection?.id) {
+      return this._searchForm;
+    }
+
+    const value = (selector: string) =>
+      (root.querySelector(selector) as HTMLInputElement | HTMLSelectElement | null)?.value;
+    const cloud = parseInt(value('.pc-cloud-slider') ?? '', 10);
+    const limit = parseInt(value('.pc-limit-select') ?? '', 10);
+
+    this._searchForm = {
+      startDate: value('.pc-date-start') ?? '',
+      endDate: value('.pc-date-end') ?? '',
+      cloudCover: Number.isFinite(cloud) ? cloud : 100,
+      limit: Number.isFinite(limit) ? limit : this._searchForm.limit,
+      sortBy: value('.pc-sort-select') ?? this._searchForm.sortBy,
+      presetName: value('.pc-preset-select') ?? '',
+    };
+    return this._searchForm;
+  }
+
+  /**
+   * Builds STAC search parameters from the search form.
+   *
+   * @param includeView - Fall back to the current map view when no bbox was drawn.
+   * @returns The search parameters.
+   */
+  private _buildSearchParams(includeView: boolean): STACSearchParams {
+    const form = this._readSearchForm();
+    const params: STACSearchParams = {};
+    const collection = this._state.selectedCollection;
+    if (collection) params.collections = [collection.id];
+
+    if (form.startDate || form.endDate) {
+      const start = form.startDate ? `${form.startDate}T00:00:00Z` : '..';
+      const end = form.endDate ? `${form.endDate}T23:59:59Z` : '..';
+      params.datetime = `${start}/${end}`;
+    }
+
+    if (this._state.drawnBbox) {
+      params.bbox = this._state.drawnBbox;
+    } else if (includeView && this._map) {
+      const bounds = this._map.getBounds();
+      params.bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+    }
+
+    // Apply cloud cover filter if set and less than 100%
+    if (form.cloudCover < 100 && collection && this._collectionSupportsCloudCover(collection)) {
+      params.query = { 'eo:cloud_cover': { lte: form.cloudCover } };
+    }
+
+    params.limit = form.limit;
+
+    const [field, direction] = form.sortBy.split('-');
+    params.sortby = [
+      {
+        field: field === 'cloud' ? 'properties.eo:cloud_cover' : 'properties.datetime',
+        direction: direction === 'asc' ? 'asc' : 'desc',
+      },
+    ];
+
+    return params;
+  }
+
+  /**
+   * Gets the preset selected in the search form.
+   *
+   * @param collection - Collection being searched.
+   * @returns The preset's name and render parameters, or undefined when the collection has none.
+   */
+  private _selectedSearchPreset(
+    collection: STACCollection
+  ): { presetName: string; renderParams: TileParams } | undefined {
+    const form = this._readSearchForm();
+    const presets = getPresetsForCollection(collection.id);
+    const preset = presets.find((p) => p.name === form.presetName) || presets[0];
+    return preset ? { presetName: preset.name, renderParams: preset.params } : undefined;
+  }
+
+  /**
+   * Builds the context handed to custom actions of the search form.
+   *
+   * @param collection - Collection being searched.
+   * @returns The action context.
+   */
+  private _searchActionContext(collection: STACCollection) {
+    const preset = this._selectedSearchPreset(collection);
+    return {
+      collection,
+      searchParams: this._buildSearchParams(true),
+      renderParams: preset?.renderParams ?? {},
+      presetName: preset?.presetName,
+    };
+  }
+
+  /**
+   * Adds a mosaic of the collection for the date range and cloud cover in the search form.
+   *
+   * @param collection - Collection to composite.
+   */
+  private async _addMosaicFromForm(collection: STACCollection): Promise<void> {
+    if (this._mosaicLoading) return;
+
+    const { bbox, ...searchParams } = this._buildSearchParams(false);
+    const preset = this._selectedSearchPreset(collection);
+    this._mosaicLoading = true;
+    this._notice = null;
+    this._renderContent();
+
+    try {
+      await this.addMosaicLayer(collection, {
+        searchParams,
+        bbox,
+        ...(preset ? { presetName: preset.presetName, renderParams: preset.renderParams } : {}),
+      });
+      this._notice = {
+        kind: 'success',
+        message: 'Mosaic added. Zoom in until tiles appear if the map looks empty.',
+      };
+    } catch (error) {
+      this._notice = {
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'Failed to add mosaic',
+      };
+      this._emit('error', error);
+    } finally {
+      this._mosaicLoading = false;
+      this._renderContent();
+    }
+  }
+
+  /**
+   * Renders the last notice (success or error) of an in-panel action.
+   *
+   * @returns HTML for the notice, or an empty string.
+   */
+  private _renderNotice(): string {
+    if (!this._notice) return '';
+    const className = this._notice.kind === 'error' ? 'pc-tool-error' : 'pc-tool-success';
+    return `<div class="${className} pc-notice">${this._escapeHtml(this._notice.message)}</div>`;
+  }
+
+  /**
+   * Renders host-supplied action buttons.
+   *
+   * @param actions - Actions for the current view.
+   * @param getContext - Builds the context, used to evaluate `isAvailable`.
+   * @returns HTML for the buttons, or an empty string when none apply.
+   */
+  private _renderCustomActions<T>(
+    actions: PlanetaryComputerCustomAction<T>[] | undefined,
+    getContext: () => T
+  ): string {
+    if (!actions?.length) return '';
+
+    let context: T | undefined;
+    const visible = actions.filter((action) => {
+      if (!action.isAvailable) return true;
+      context ??= getContext();
+      try {
+        return action.isAvailable(context);
+      } catch {
+        return false;
       }
+    });
+    if (!visible.length) return '';
 
-      if (!this._state.searchParams.bbox && this._map) {
-        const bounds = this._map.getBounds();
-        this._state.searchParams.bbox = [
-          bounds.getWest(),
-          bounds.getSouth(),
-          bounds.getEast(),
-          bounds.getNorth(),
-        ];
-      }
+    return `
+      <div class="pc-custom-actions">
+        ${visible
+          .map(
+            (action) =>
+              `<button type="button" class="pc-btn pc-btn-small pc-custom-action" data-action-id="${this._escapeHtml(action.id)}"${
+                action.title ? ` title="${this._escapeHtml(action.title)}"` : ''
+              }>${this._escapeHtml(action.label)}</button>`
+          )
+          .join('')}
+      </div>
+    `;
+  }
 
-      // Apply cloud cover filter if set and less than 100%
-      if (cloudCover && parseInt(cloudCover) < 100) {
-        this._state.searchParams.query = {
-          'eo:cloud_cover': { lte: parseInt(cloudCover) },
-        };
-      }
+  /**
+   * Wires the click handlers of host-supplied action buttons.
+   *
+   * @param actions - Actions for the current view.
+   * @param getContext - Builds the context at click time.
+   * @param root - Element to look for the buttons in. Defaults to the panel content.
+   */
+  private _bindCustomActions<T>(
+    actions: PlanetaryComputerCustomAction<T>[] | undefined,
+    getContext: () => T,
+    root: ParentNode | undefined = this._contentEl
+  ): void {
+    if (!actions?.length || !root) return;
 
-      // Apply limit
-      if (limit) {
-        this._state.searchParams.limit = parseInt(limit);
-      }
+    root.querySelectorAll<HTMLElement>('.pc-custom-action').forEach((button) => {
+      const action = actions.find((candidate) => candidate.id === button.dataset.actionId);
+      if (!action) return;
 
-      // Apply sort
-      if (sortBy) {
-        const [field, direction] = sortBy.split('-');
-        const sortField = field === 'cloud' ? 'properties.eo:cloud_cover' : 'properties.datetime';
-        this._state.searchParams.sortby = [{ field: sortField, direction: direction as 'asc' | 'desc' }];
-      }
-
-      this.search();
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        try {
+          await action.onClick(getContext());
+        } catch (error) {
+          this._notice = {
+            kind: 'error',
+            message: error instanceof Error ? error.message : `${action.label} failed`,
+          };
+          this._emit('error', error);
+          this._renderContent();
+        }
+      });
     });
   }
 
@@ -1639,6 +2112,18 @@ export class PlanetaryComputerControl implements IControl {
 
     const results = this._state.searchResults;
     const selectedId = this._state.selectedSearchResultId;
+    const resultsContext = () => {
+      const collection = this._state.selectedCollection;
+      const presets = collection ? getPresetsForCollection(collection.id) : [];
+      const preset = presets.find((p) => p.name === this._searchForm.presetName) || presets[0];
+      return {
+        collection,
+        items: this._state.searchResults,
+        searchParams: this._state.searchParams,
+        renderParams: preset?.params ?? {},
+        presetName: preset?.name,
+      };
+    };
 
     this._contentEl.innerHTML = `
       <div class="pc-results">
@@ -1660,6 +2145,8 @@ export class PlanetaryComputerControl implements IControl {
             Download STAC JSON
           </button>
         </div>
+        ${this._renderCustomActions(this._options.customActions?.results, resultsContext)}
+        ${this._renderNotice()}
         `
             : ''
         }
@@ -1672,7 +2159,7 @@ export class PlanetaryComputerControl implements IControl {
                     (item) => `
                 <div class="pc-result-item${
                   selectedId === item.id ? ' pc-result-selected' : ''
-                }" data-id="${item.id}">
+                }" data-id="${this._escapeHtml(item.id)}">
                   ${
                     item.assets.thumbnail?.href
                       ? `<div class="pc-result-thumbnail"><img src="${item.assets.thumbnail.href}" alt="" loading="lazy"></div>`
@@ -1716,6 +2203,8 @@ export class PlanetaryComputerControl implements IControl {
       this.downloadStacJson();
     });
 
+    this._bindCustomActions(this._options.customActions?.results, resultsContext);
+
     this._contentEl.querySelectorAll('.pc-result-item').forEach((el) => {
       const id = el.getAttribute('data-id');
       const item = results.find((i) => i.id === id);
@@ -1723,7 +2212,11 @@ export class PlanetaryComputerControl implements IControl {
 
       el.querySelector('.pc-add-layer')?.addEventListener('click', (e) => {
         e.stopPropagation();
-        const layer = this.addItemLayer(item);
+        const preset = item.collection ? getPreset(item.collection, this._searchForm.presetName) : undefined;
+        const layer = this.addItemLayer(
+          item,
+          preset ? { presetName: preset.name, renderParams: preset.params } : undefined
+        );
         if (layer) {
           this.zoomToLayer(layer.id);
         }
@@ -1757,26 +2250,7 @@ export class PlanetaryComputerControl implements IControl {
              type.includes('image') || !type; // Include if no type specified
     });
 
-    // Common colormaps available in TiTiler
-    const colormaps = [
-      { name: '', label: 'None (Default)' },
-      { name: 'viridis', label: 'Viridis' },
-      { name: 'plasma', label: 'Plasma' },
-      { name: 'inferno', label: 'Inferno' },
-      { name: 'magma', label: 'Magma' },
-      { name: 'cividis', label: 'Cividis' },
-      { name: 'terrain', label: 'Terrain' },
-      { name: 'rdylgn', label: 'Red-Yellow-Green' },
-      { name: 'rdylbu', label: 'Red-Yellow-Blue' },
-      { name: 'spectral', label: 'Spectral' },
-      { name: 'coolwarm', label: 'Cool-Warm' },
-      { name: 'blues', label: 'Blues' },
-      { name: 'greens', label: 'Greens' },
-      { name: 'reds', label: 'Reds' },
-      { name: 'greys', label: 'Greys' },
-      { name: 'ylgnbu', label: 'Yellow-Green-Blue' },
-      { name: 'rainbow', label: 'Rainbow' },
-    ];
+    const colormaps = COLORMAPS;
 
     this._contentEl.innerHTML = `
       <div class="pc-item-details">
@@ -1918,8 +2392,10 @@ export class PlanetaryComputerControl implements IControl {
             <button type="button" class="pc-btn pc-btn-small pc-export-bbox" ${
               this._state.drawnBbox ? '' : 'disabled'
             }>BBox Image</button>
+            <button type="button" class="pc-btn pc-btn-small pc-download-clip" title="Download the drawn bounding box (or the current map view) as a GeoTIFF of raw band values">Clip GeoTIFF</button>
           </div>
-          <div class="pc-tool-output pc-stats-output"></div>
+          <div class="pc-item-custom-actions"></div>
+          <div class="pc-tool-output pc-stats-output">${this._renderNotice()}</div>
         </div>
 
         <div class="pc-details-section">
@@ -1996,6 +2472,42 @@ export class PlanetaryComputerControl implements IControl {
       this._openItemBboxImage(item, getCurrentRenderParams());
     });
 
+    this._contentEl.querySelector('.pc-download-clip')?.addEventListener('click', () => {
+      const output = this._contentEl?.querySelector('.pc-stats-output') as HTMLElement | null;
+      const url = this.getItemClipUrl(item, getCurrentRenderParams());
+      if (!url) {
+        if (output) {
+          output.innerHTML =
+            '<div class="pc-tool-error">The clip area does not overlap this item. Draw a bounding box inside its footprint or move the map over it.</div>';
+        }
+        return;
+      }
+      window.open(url, '_blank');
+    });
+
+    // Host actions are drawn after the form exists, and again whenever it
+    // changes, so `isAvailable` sees the render parameters a click would get.
+    const itemActions = this._contentEl.querySelector<HTMLElement>('.pc-item-custom-actions');
+    const itemActionContext = () => ({
+      item,
+      renderParams: getCurrentRenderParams(),
+      bbox: this._state.drawnBbox,
+    });
+    const refreshItemActions = () => {
+      if (!itemActions) return;
+      itemActions.innerHTML = this._renderCustomActions(
+        this._options.customActions?.item,
+        itemActionContext
+      );
+      this._bindCustomActions(this._options.customActions?.item, itemActionContext, itemActions);
+    };
+    refreshItemActions();
+    if (this._options.customActions?.item?.length) {
+      this._contentEl
+        .querySelector('.pc-details-section')
+        ?.addEventListener('change', refreshItemActions);
+    }
+
     this._contentEl.querySelector('.pc-add-to-map')?.addEventListener('click', () => {
       const presetName = (this._contentEl?.querySelector('.pc-preset-select') as HTMLSelectElement)?.value;
       let layer;
@@ -2057,6 +2569,9 @@ export class PlanetaryComputerControl implements IControl {
     if (expression) {
       renderParams.expression = expression;
       delete renderParams.assets;
+      if (expressionUsesAssetsAsBands(expression)) {
+        renderParams.asset_as_band = true;
+      }
     }
 
     return renderParams;
@@ -2261,15 +2776,16 @@ export class PlanetaryComputerControl implements IControl {
   /**
    * Renders a legend ramp for a named colormap.
    */
-  private _renderLegend(colormapName: string): string {
+  private _renderLegend(colormapName: string, rescale?: string): string {
     const gradient = this._getColormapGradient(colormapName);
+    const [low = 'Low', high = 'High'] = rescale ? rescale.split(',') : [];
     return `
       <div class="pc-legend-card">
         <div class="pc-legend-title">${this._escapeHtml(colormapName)}</div>
         <div class="pc-legend-ramp" style="background:${gradient}"></div>
         <div class="pc-legend-labels">
-          <span>Low</span>
-          <span>High</span>
+          <span>${this._escapeHtml(low)}</span>
+          <span>${this._escapeHtml(high)}</span>
         </div>
       </div>
     `;
@@ -2294,6 +2810,8 @@ export class PlanetaryComputerControl implements IControl {
       greens: 'linear-gradient(to right, #f7fcf5, #c7e9c0, #74c476, #238b45, #00441b)',
       reds: 'linear-gradient(to right, #fff5f0, #fcbba1, #fb6a4a, #cb181d, #67000d)',
       greys: 'linear-gradient(to right, #ffffff, #d9d9d9, #969696, #525252, #000000)',
+      gray: 'linear-gradient(to right, #000000, #ffffff)',
+      rdylbu_r: 'linear-gradient(to right, #313695, #74add1, #e0f3f8, #ffffbf, #fee090, #f46d43, #a50026)',
       ylgnbu: 'linear-gradient(to right, #ffffd9, #c7e9b4, #41b6c4, #2c7fb8, #081d58)',
       rainbow: 'linear-gradient(to right, #6e40aa, #4776d0, #1f9e89, #6cc24a, #f5d547, #f98e2b, #d23b3b)',
     };
@@ -2418,11 +2936,11 @@ export class PlanetaryComputerControl implements IControl {
         ${layers
           .map(
             (layer) => `
-          <div class="pc-layer-item" data-id="${layer.id}">
+          <div class="pc-layer-item" data-id="${this._escapeHtml(layer.id)}">
             <div class="pc-layer-header">
               <input type="checkbox" class="pc-layer-visibility" ${layer.visible ? 'checked' : ''}>
-              <span class="pc-layer-name" title="${layer.item?.id || layer.collection?.title || layer.id}">
-                ${layer.item?.id || layer.collection?.title || layer.id}
+              <span class="pc-layer-name" title="${this._escapeHtml(this._layerLabel(layer))}">
+                ${this._escapeHtml(this._layerLabel(layer))}
               </span>
               <button type="button" class="pc-btn-icon pc-toggle-layer-controls${
                 layer.showControls ? ' pc-layer-controls-active' : ''
@@ -2440,7 +2958,7 @@ export class PlanetaryComputerControl implements IControl {
                 </svg>
               </button>
               ${
-                layer.item
+                layer.item || layer.mosaicId
                   ? `<button type="button" class="pc-btn-icon pc-inspect-layer${
                       this._inspectorLayerId === layer.id ? ' pc-inspect-active' : ''
                     }" title="${this._inspectorLayerId === layer.id ? 'Stop inspecting' : 'Inspect pixel values'}">
@@ -2467,7 +2985,9 @@ export class PlanetaryComputerControl implements IControl {
                 Opacity: <span class="pc-opacity-value">${Math.round(layer.opacity * 100)}%</span>
               </label>
               <input type="range" class="pc-opacity-slider" min="0" max="100" value="${Math.round(layer.opacity * 100)}">
-              ${layer.renderParams.colormap_name ? this._renderLegend(layer.renderParams.colormap_name) : ''}
+              ${layer.renderParams.colormap_name ? this._renderLegend(layer.renderParams.colormap_name, layer.renderParams.rescale) : ''}
+              ${this._renderLayerStyleForm(layer)}
+              ${this._renderCustomActions(this._options.customActions?.layer, () => ({ layer }))}
             </div>
           </div>
         `
@@ -2504,6 +3024,28 @@ export class PlanetaryComputerControl implements IControl {
         this.zoomToLayer(layerId);
       });
 
+      const presetSelect = el.querySelector('.pc-layer-preset') as HTMLSelectElement | null;
+      const customStyle = el.querySelector('.pc-layer-custom-style') as HTMLElement | null;
+      presetSelect?.addEventListener('change', () => {
+        if (customStyle) customStyle.style.display = presetSelect.value ? 'none' : '';
+      });
+
+      el.querySelector('.pc-apply-style')?.addEventListener('click', () => {
+        const layer = this._state.activeLayers.find((activeLayer) => activeLayer.id === layerId);
+        if (!layer) return;
+        const style = this._readLayerStyleForm(el, layer);
+        this.updateLayer(layerId, style);
+        this._renderContent();
+      });
+
+      this._bindCustomActions(
+        this._options.customActions?.layer,
+        () => ({
+          layer: this._state.activeLayers.find((activeLayer) => activeLayer.id === layerId) as ActiveLayer,
+        }),
+        el
+      );
+
       el.querySelector('.pc-remove-layer')?.addEventListener('click', () => {
         this.removeLayer(layerId);
       });
@@ -2519,13 +3061,137 @@ export class PlanetaryComputerControl implements IControl {
   }
 
   /**
-   * Starts map click inspection for an item layer.
+   * Gets the display name of a layer.
+   *
+   * @param layer - Layer configuration.
+   * @returns The item id, or the collection title (with the date range for a mosaic).
+   */
+  private _layerLabel(layer: ActiveLayer): string {
+    if (layer.item) return layer.item.id;
+    const title = layer.collection?.title || layer.collection?.id || layer.id;
+    const datetime = layer.searchParams?.datetime;
+    if (!datetime) return title;
+    const range = datetime
+      .split('/')
+      .map((part) => (part === '..' ? '' : part.slice(0, 10)))
+      .join(' to ');
+    return `${title} (${range})`;
+  }
+
+  /**
+   * Renders the per-layer restyle form (preset, colormap, rescale, expression).
+   *
+   * @param layer - Layer configuration.
+   * @returns HTML for the form.
+   */
+  private _renderLayerStyleForm(layer: ActiveLayer): string {
+    const collectionId = layer.item?.collection || layer.collection?.id || '';
+    const presets = collectionId ? getPresetsForCollection(collectionId) : [];
+    const params = layer.renderParams;
+    const [rescaleMin = '', rescaleMax = ''] = (params.rescale || '').split(',');
+    const usingPreset = Boolean(layer.presetName && presets.some((p) => p.name === layer.presetName));
+
+    return `
+      <div class="pc-layer-style">
+        ${
+          presets.length
+            ? `
+          <label class="pc-label">Preset</label>
+          <select class="pc-input pc-layer-preset">
+            <option value="">Custom</option>
+            ${presets
+              .map(
+                (p) =>
+                  `<option value="${p.name}"${usingPreset && layer.presetName === p.name ? ' selected' : ''}>${p.label}</option>`
+              )
+              .join('')}
+          </select>
+        `
+            : ''
+        }
+        <div class="pc-layer-custom-style"${usingPreset ? ' style="display:none"' : ''}>
+          <label class="pc-label">Colormap</label>
+          <select class="pc-input pc-layer-colormap">
+            ${COLORMAPS.map(
+              (c) =>
+                `<option value="${c.name}"${(params.colormap_name || '') === c.name ? ' selected' : ''}>${c.label}</option>`
+            ).join('')}
+          </select>
+          <label class="pc-label">Rescale (Min, Max)</label>
+          <div class="pc-rescale-inputs">
+            <input type="number" class="pc-input pc-layer-rescale-min" placeholder="Min" step="any" value="${this._escapeHtml(rescaleMin)}">
+            <span class="pc-rescale-separator">to</span>
+            <input type="number" class="pc-input pc-layer-rescale-max" placeholder="Max" step="any" value="${this._escapeHtml(rescaleMax)}">
+          </div>
+          <label class="pc-label">Band Expression (optional)</label>
+          <input type="text" class="pc-input pc-layer-expression" placeholder="e.g., (B08-B04)/(B08+B04)" value="${this._escapeHtml(params.expression || '')}">
+        </div>
+        <button type="button" class="pc-btn pc-btn-small pc-apply-style">Apply Style</button>
+      </div>
+    `;
+  }
+
+  /**
+   * Reads the per-layer restyle form into layer updates.
+   *
+   * @param root - The layer row element.
+   * @param layer - Layer being restyled.
+   * @returns The `renderParams`, `assets`, and `presetName` to apply.
+   */
+  private _readLayerStyleForm(
+    root: Element,
+    layer: ActiveLayer
+  ): Pick<ActiveLayer, 'renderParams' | 'assets' | 'presetName'> {
+    const collectionId = layer.item?.collection || layer.collection?.id || '';
+    const presetName = (root.querySelector('.pc-layer-preset') as HTMLSelectElement | null)?.value;
+    const preset = presetName ? getPreset(collectionId, presetName) : undefined;
+    if (preset) {
+      return {
+        renderParams: { ...preset.params },
+        assets: preset.params.assets || [],
+        presetName: preset.name,
+      };
+    }
+
+    const colormap = (root.querySelector('.pc-layer-colormap') as HTMLSelectElement | null)?.value;
+    const min = (root.querySelector('.pc-layer-rescale-min') as HTMLInputElement | null)?.value;
+    const max = (root.querySelector('.pc-layer-rescale-max') as HTMLInputElement | null)?.value;
+    const expression = (
+      root.querySelector('.pc-layer-expression') as HTMLInputElement | null
+    )?.value.trim();
+
+    const renderParams: TileParams = { ...layer.renderParams };
+    delete renderParams.colormap_name;
+    delete renderParams.rescale;
+    delete renderParams.expression;
+    delete renderParams.asset_as_band;
+
+    if (colormap) renderParams.colormap_name = colormap;
+    if (min && max) renderParams.rescale = `${min},${max}`;
+
+    let assets = layer.assets;
+    if (expression) {
+      renderParams.expression = expression;
+      if (expressionUsesAssetsAsBands(expression)) renderParams.asset_as_band = true;
+      delete renderParams.assets;
+      assets = [];
+    } else if (!assets.length) {
+      // Leaving an expression: fall back to the collection's default assets.
+      const fallback = collectionId ? getPresetsForCollection(collectionId)[0]?.params.assets : undefined;
+      assets = fallback || [];
+    }
+
+    return { renderParams, assets, presetName: undefined };
+  }
+
+  /**
+   * Starts map click inspection for an item or mosaic layer.
    */
   private _startInspector(layerId: string): void {
     if (!this._map || !this._layerManager) return;
 
     const layer = this._layerManager.getLayer(layerId);
-    if (!layer?.item?.collection) return;
+    if (!layer?.item?.collection && !layer?.mosaicId) return;
 
     this._stopInspector(false);
     this._inspectorLayerId = layerId;
@@ -2563,9 +3229,9 @@ export class PlanetaryComputerControl implements IControl {
    */
   private async _queryInspectorPoint(layerId: string, lon: number, lat: number): Promise<void> {
     const layer = this._layerManager?.getLayer(layerId);
-    if (!layer?.item?.collection) return;
+    if (!layer) return;
 
-    if (!this._itemBboxContainsPoint(layer.item, lon, lat)) {
+    if (layer.item && !this._itemBboxContainsPoint(layer.item, lon, lat)) {
       this._inspectorResult = {
         layerId,
         lon,
@@ -2586,13 +3252,7 @@ export class PlanetaryComputerControl implements IControl {
     this._renderContent();
 
     try {
-      const data = await this._tilerClient.getItemPoint(
-        layer.item.collection,
-        layer.item.id,
-        lon,
-        lat,
-        layer.renderParams
-      );
+      const data = await this.queryLayerPoint(layerId, lon, lat);
 
       if (this._inspectorLayerId !== layerId) return;
 
@@ -2654,7 +3314,7 @@ export class PlanetaryComputerControl implements IControl {
     if (!this._inspectorLayerId) return '';
 
     const layer = this._state.activeLayers.find((activeLayer) => activeLayer.id === this._inspectorLayerId);
-    const layerName = layer?.item?.id || layer?.id || this._inspectorLayerId;
+    const layerName = layer ? this._layerLabel(layer) : this._inspectorLayerId;
     const result = this._inspectorResult;
 
     if (!result) {
