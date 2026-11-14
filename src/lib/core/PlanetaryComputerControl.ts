@@ -1594,6 +1594,11 @@ export class PlanetaryComputerControl implements IControl {
 
       button.addEventListener('click', async (event) => {
         event.stopPropagation();
+        // A notice left by an earlier attempt would otherwise sit next to the
+        // result of this one. Removing the node (not re-rendering) keeps the
+        // form the user is filling in.
+        this._notice = null;
+        this._contentEl?.querySelectorAll('.pc-notice').forEach((notice) => notice.remove());
         try {
           await action.onClick(getContext());
         } catch (error) {
