@@ -139,6 +139,23 @@ describe('buildMosaicSearchBody', () => {
     });
   });
 
+  it('treats several collections as alternatives and keeps an intersects geometry', () => {
+    const geometry = { type: 'Point' as const, coordinates: [1, 2] };
+    expect(
+      buildMosaicSearchBody({ collections: ['naip', 'sentinel-2-l2a'], intersects: geometry })
+    ).toEqual({
+      'filter-lang': 'cql2-json',
+      collections: ['naip', 'sentinel-2-l2a'],
+      filter: {
+        op: 'and',
+        args: [
+          { op: 'in', args: [{ property: 'collection' }, ['naip', 'sentinel-2-l2a']] },
+          { op: 's_intersects', args: [{ property: 'geometry' }, geometry] },
+        ],
+      },
+    });
+  });
+
   it('keeps a single condition unwrapped and handles open date ranges', () => {
     expect(buildMosaicSearchBody({ collections: ['naip'] }).filter).toEqual({
       op: '=',

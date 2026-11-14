@@ -300,6 +300,8 @@ export class PlanetaryComputerControl implements IControl {
 
     // Remove layers from map
     this._layerManager?.removeAllLayers();
+    this._layerManager = undefined;
+    this._state.activeLayers = [];
 
     // Remove DOM elements
     this._panel?.parentNode?.removeChild(this._panel);
@@ -464,13 +466,18 @@ export class PlanetaryComputerControl implements IControl {
     delete searchParams.bbox;
     delete searchParams.ids;
 
+    // Registration is asynchronous; the control may be removed (or re-added to
+    // another map) before it completes, and must not gain a layer then.
+    const layerManager = this._layerManager;
     let searchId = options?.mosaicId;
     if (!searchId) {
       ({ searchId } = await this._tilerClient.registerMosaic(searchParams));
-      if (!this._layerManager) throw new Error('Control was removed from the map');
+      if (this._layerManager !== layerManager || !this._map) {
+        throw new Error('Control was removed from the map');
+      }
     }
 
-    const layer = this._layerManager.addMosaicLayer(collection, searchId, {
+    const layer = layerManager.addMosaicLayer(collection, searchId, {
       ...options,
       searchParams,
     });
@@ -1184,7 +1191,7 @@ export class PlanetaryComputerControl implements IControl {
     const supportsCloudCover = this._collectionSupportsCloudCover(collection);
 
     this._contentEl.innerHTML = `
-      <div class="pc-search-panel">
+      <div class="pc-search-panel" data-collection-id="${this._escapeHtml(collection.id)}">
         <button type="button" class="pc-btn-back">&larr; Back to collections</button>
 
         <div class="pc-selected-collection">
@@ -1383,7 +1390,13 @@ export class PlanetaryComputerControl implements IControl {
    */
   private _readSearchForm(): SearchFormState {
     const root = this._contentEl;
-    if (!root?.querySelector('.pc-search-panel')) return this._searchForm;
+    // Only the mounted form of the collection being searched is authoritative.
+    // While the view is being re-rendered for another collection the DOM still
+    // holds the previous collection's inputs, which must not leak into its form.
+    const panel = root?.querySelector<HTMLElement>('.pc-search-panel');
+    if (!root || !panel || panel.dataset.collectionId !== this._state.selectedCollection?.id) {
+      return this._searchForm;
+    }
 
     const value = (selector: string) =>
       (root.querySelector(selector) as HTMLInputElement | HTMLSelectElement | null)?.value;
@@ -2146,7 +2159,7 @@ export class PlanetaryComputerControl implements IControl {
                     (item) => `
                 <div class="pc-result-item${
                   selectedId === item.id ? ' pc-result-selected' : ''
-                }" data-id="${item.id}">
+                }" data-id="${this._escapeHtml(item.id)}">
                   ${
                     item.assets.thumbnail?.href
                       ? `<div class="pc-result-thumbnail"><img src="${item.assets.thumbnail.href}" alt="" loading="lazy"></div>`
@@ -2381,11 +2394,7 @@ export class PlanetaryComputerControl implements IControl {
             }>BBox Image</button>
             <button type="button" class="pc-btn pc-btn-small pc-download-clip" title="Download the drawn bounding box (or the current map view) as a GeoTIFF of raw band values">Clip GeoTIFF</button>
           </div>
-          ${this._renderCustomActions(this._options.customActions?.item, () => ({
-            item,
-            renderParams: {},
-            bbox: this._state.drawnBbox,
-          }))}
+          <div class="pc-item-custom-actions"></div>
           <div class="pc-tool-output pc-stats-output">${this._renderNotice()}</div>
         </div>
 
@@ -2476,11 +2485,28 @@ export class PlanetaryComputerControl implements IControl {
       window.open(url, '_blank');
     });
 
-    this._bindCustomActions(this._options.customActions?.item, () => ({
+    // Host actions are drawn after the form exists, and again whenever it
+    // changes, so `isAvailable` sees the render parameters a click would get.
+    const itemActions = this._contentEl.querySelector<HTMLElement>('.pc-item-custom-actions');
+    const itemActionContext = () => ({
       item,
       renderParams: getCurrentRenderParams(),
       bbox: this._state.drawnBbox,
-    }));
+    });
+    const refreshItemActions = () => {
+      if (!itemActions) return;
+      itemActions.innerHTML = this._renderCustomActions(
+        this._options.customActions?.item,
+        itemActionContext
+      );
+      this._bindCustomActions(this._options.customActions?.item, itemActionContext, itemActions);
+    };
+    refreshItemActions();
+    if (this._options.customActions?.item?.length) {
+      this._contentEl
+        .querySelector('.pc-details-section')
+        ?.addEventListener('change', refreshItemActions);
+    }
 
     this._contentEl.querySelector('.pc-add-to-map')?.addEventListener('click', () => {
       const presetName = (this._contentEl?.querySelector('.pc-preset-select') as HTMLSelectElement)?.value;
@@ -2910,7 +2936,7 @@ export class PlanetaryComputerControl implements IControl {
         ${layers
           .map(
             (layer) => `
-          <div class="pc-layer-item" data-id="${layer.id}">
+          <div class="pc-layer-item" data-id="${this._escapeHtml(layer.id)}">
             <div class="pc-layer-header">
               <input type="checkbox" class="pc-layer-visibility" ${layer.visible ? 'checked' : ''}>
               <span class="pc-layer-name" title="${this._escapeHtml(this._layerLabel(layer))}">

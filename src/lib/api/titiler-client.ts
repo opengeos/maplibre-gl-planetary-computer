@@ -32,7 +32,7 @@ function datetimeInterval(datetime: string): [string, string] {
  * Builds the body for a Data API `POST /mosaic/register` request.
  *
  * The mosaic endpoint takes a CQL2 search, so the simple STAC search fields
- * (`datetime`, the `query` extension, `bbox`) are translated into one CQL2
+ * (`datetime`, the `query` extension, `bbox`, `intersects`) are translated into one CQL2
  * JSON `filter`. An explicit `filter` in the parameters is combined with them.
  *
  * @param searchParams - STAC search parameters describing the mosaic.
@@ -41,8 +41,12 @@ function datetimeInterval(datetime: string): [string, string] {
 export function buildMosaicSearchBody(searchParams: Partial<STACSearchParams>): Record<string, unknown> {
   const args: unknown[] = [];
 
-  for (const collection of searchParams.collections ?? []) {
-    args.push({ op: '=', args: [{ property: 'collection' }, collection] });
+  // Several collections are alternatives: an item belongs to exactly one.
+  const collections = searchParams.collections ?? [];
+  if (collections.length === 1) {
+    args.push({ op: '=', args: [{ property: 'collection' }, collections[0]] });
+  } else if (collections.length > 1) {
+    args.push({ op: 'in', args: [{ property: 'collection' }, collections] });
   }
   if (searchParams.datetime) {
     args.push({
@@ -70,6 +74,9 @@ export function buildMosaicSearchBody(searchParams: Partial<STACSearchParams>): 
         },
       ],
     });
+  }
+  if (searchParams.intersects) {
+    args.push({ op: 's_intersects', args: [{ property: 'geometry' }, searchParams.intersects] });
   }
   for (const [property, conditions] of Object.entries(searchParams.query ?? {})) {
     if (!conditions || typeof conditions !== 'object') continue;
